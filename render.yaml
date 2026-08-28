@@ -3,7 +3,7 @@ services:
     name: telegram-sub2unlock-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python sub2unlockbot.py
+    startCommand: python sub2unlock.py
     envVars:
       - key: BOT_TOKEN
         sync: false
