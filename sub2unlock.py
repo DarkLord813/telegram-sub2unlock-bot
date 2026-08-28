@@ -959,8 +959,7 @@ class BotHandlers:
                 btns.append([InlineKeyboardButton(f'❌ Remove {ch["channel_name"]}', callback_data=f'remove_{ch["id"]}')])
             text += '\n⚠️ Users must join ALL these channels to download your files.\n\n'
 
-            kb = btns
-        else:
+            kb = btns        else:
             text += '📭 No channels added yet.\n\n'
             text += 'Add channels that users must join to download your files.\n\n'
             text += '⚠️ You must add at least one channel to upload files.'
@@ -1199,7 +1198,7 @@ class BotHandlers:
 
 
 # ============================================
-# MAIN
+# MAIN - FIXED VERSION
 # ============================================
 async def main():
     """Main entry point"""
@@ -1244,22 +1243,10 @@ async def main():
     logger.info('\n✅ Bot is ready!')
     logger.info(f'\n👑 Admins: {", ".join(str(a) for a in ADMIN_IDS) if ADMIN_IDS else "None"}')
 
-    # Start the bot
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-
-    # Keep running
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info('\n🛑 Shutting down...')
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        db.close()
+    # ============================================
+    # FIX: Use run_polling() instead of manual start
+    # ============================================
+    await application.run_polling()
 
 
 if __name__ == '__main__':
