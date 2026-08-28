@@ -1,19 +1,15 @@
 import os
 import sys
-import json
 import sqlite3
-import hashlib
 import secrets
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any, Tuple
-from dataclasses import dataclass, field
-from pathlib import Path
+from typing import Optional, Dict, List, Any
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ChatMember, ChatInviteLink
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -30,9 +26,8 @@ load_dotenv()
 # ============================================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
-DB_PATH = './bot_database.db'
+DB_PATH = os.getenv('DB_PATH', './bot_database.db')
 MAX_FILE_SIZE_SEND = 50 * 1024 * 1024  # 50MB for direct send
-MAX_FILE_SIZE_FORWARD = 2 * 1024 * 1024 * 1024  # 2GB for forward
 
 if not BOT_TOKEN:
     print('❌ BOT_TOKEN is not set in environment variables')
@@ -91,6 +86,11 @@ class Database:
 
     def init_db(self):
         """Initialize database connection and create tables"""
+        # Ensure directory exists
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         cursor = self.conn.cursor()
@@ -218,7 +218,7 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute(
             'INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)',
-            (user_id, username, first_name)
+            (user_id, username or '', first_name)
         )
         self.conn.commit()
 
@@ -370,6 +370,7 @@ class FileSharingBot:
         self.bot_username = ''
         self.bot_id = 0
         self.sessions = {}
+        self._cleanup_task = None
 
     async def init(self):
         """Initialize the bot"""
@@ -397,7 +398,16 @@ class FileSharingBot:
             ('start', '🚀 Start the bot'),
         ])
 
+        # Start cleanup task
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
         logger.info('\n✅ Bot is ready!')
+
+    async def _cleanup_loop(self):
+        """Background task for cleaning up expired files"""
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            await self.cleanup_expired_files()
 
     async def start(self):
         """Start the bot application"""
@@ -408,6 +418,13 @@ class FileSharingBot:
 
     async def stop(self):
         """Stop the bot application"""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
         if self.application:
             await self.application.updater.stop()
             await self.application.stop()
@@ -561,7 +578,6 @@ class FileSharingBot:
                 try:
                     chat_info = await self.application.bot.get_chat(clean_id)
                 except Exception:
-                    import re
                     match = re.search(r't\.me/(.+)', identifier)
                     if match:
                         username = match.group(1)
@@ -666,7 +682,7 @@ class FileSharingBot:
         channel_ids = file.get('channel_ids', '').split(',') if file.get('channel_ids') else []
         channel_names = file.get('channel_names', '').split(',') if file.get('channel_names') else []
 
-        if not channel_ids:
+        if not channel_ids or not channel_ids[0]:
             await self.send_message(chat_id, '❌ No channels required for this file.')
             return
 
@@ -686,6 +702,10 @@ class FileSharingBot:
                 })
                 kb.append([InlineKeyboardButton(f'📢 Join {name}', url=link)])
                 channel_list.append(f'• {name}')
+
+        if not kb:
+            await self.send_message(chat_id, '❌ No channels found for this file.')
+            return
 
         kb.append([InlineKeyboardButton("✅ I've Joined All", callback_data=f'joined_channels_{file["id"]}')])
 
@@ -1276,7 +1296,8 @@ class FileSharingBot:
             btns = []
             for f in files[:10]:
                 text += f'📄 {f["name"]}\n'
-                text += f'📦 {self.format_file_size(f["size"])} | ⏰ {self.format_expiry((datetime.fromisoformat(f["expiry"]) - datetime.fromisoformat(f["created_at"])).total_seconds()) if f["expiry"] else "♾️ Permanent"}\n'
+                expiry_text = self.format_expiry((datetime.fromisoformat(f["expiry"]) - datetime.fromisoformat(f["created_at"])).total_seconds()) if f["expiry"] else "♾️ Permanent"
+                text += f'📦 {self.format_file_size(f["size"])} | ⏰ {expiry_text}\n'
                 text += f'📥 {f["downloads"]} downloads\n'
                 text += f'🔗 https://t.me/{self.bot_username}?start={f["link_code"]}\n\n'
                 btns.append([InlineKeyboardButton(f'🗑 Delete: {f["name"][:15]}', callback_data=f'delete_{f["id"]}')])
@@ -1425,7 +1446,8 @@ class FileSharingBot:
             for f in files:
                 text += f'📄 {f["name"]}\n'
                 text += f'📥 {f["downloads"]} downloads\n'
-                text += f'⏰ {self.format_expiry((datetime.fromisoformat(f["expiry"]) - datetime.fromisoformat(f["created_at"])).total_seconds()) if f["expiry"] else "♾️ Permanent"}\n\n'
+                expiry_text = self.format_expiry((datetime.fromisoformat(f["expiry"]) - datetime.fromisoformat(f["created_at"])).total_seconds()) if f["expiry"] else "♾️ Permanent"
+                text += f'⏰ {expiry_text}\n\n'
                 btns.append([InlineKeyboardButton(f'🗑 Delete: {f["name"][:15]}', callback_data=f'admin_delete_{f["id"]}')])
             btns.append([InlineKeyboardButton('🔙 Back', callback_data='admin')])
             await query.edit_message_text(
