@@ -1,9 +1,9 @@
 services:
   - type: web
     name: telegram-sub2unlock-bot
-    env: node
-    buildCommand: npm install
-    startCommand: npm start
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python sub2unlockbot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
