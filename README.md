@@ -54,5 +54,5 @@ The bot includes two default required channels:
 
 ### 1️⃣ Clone the Repository
 ```bash
-git clone https://github.com/DarkLord813/sub2unlock-bot.git
-cd sub2unlock-bot
+git clone https://github.com/DarkLord813/telegram-sub2unlock-bot.git
+cd telegram-sub2unlock-bot
