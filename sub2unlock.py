@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================
 # TELEGRAM FILE SHARING BOT - COMPLETE WORKING VERSION
-# Fixed: All sessions properly processed
+# All features working - File upload, channels, sessions
 # ============================================
 
 import os
@@ -11,7 +11,7 @@ import secrets
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -349,7 +349,7 @@ class BotHandlers:
         self.db = db
         self.bot_username = ''
         self.bot_id = 0
-        self.sessions = {}  # user_id -> session data
+        self.sessions = {}
 
     def format_file_size(self, bytes: int) -> str:
         if bytes < 1024:
@@ -381,7 +381,6 @@ class BotHandlers:
         return user_id in ADMIN_IDS
 
     def get_session(self, user_id: int) -> Optional[Dict]:
-        """Get session for user, remove if expired (> 1 hour)"""
         session = self.sessions.get(user_id)
         if session and session.get('created_at'):
             if (datetime.now() - session['created_at']).seconds > 3600:
@@ -390,39 +389,24 @@ class BotHandlers:
         return session
 
     def set_session(self, user_id: int, data: Dict):
-        """Set session for user with timestamp"""
         data['created_at'] = datetime.now()
         self.sessions[user_id] = data
 
     def clear_session(self, user_id: int):
-        """Clear session for user"""
         self.sessions.pop(user_id, None)
 
     # ============================================
     # START COMMAND
     # ============================================
     def start_command(self, update: Update, context: CallbackContext):
-        """Handle /start command"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         first_name = update.effective_user.first_name or 'User'
         
-        logger.info(f"📨 /start command from user {user_id} ({first_name})")
+        logger.info(f"📨 /start from user {user_id}")
         
-        # Create user in database
         self.db.create_user(user_id, update.effective_user.username or '', first_name)
-        
-        # Clear any existing session
         self.clear_session(user_id)
-        
-        # Show welcome message
-        welcome_text = (
-            f"👋 Welcome {first_name}!\n\n"
-            f"🤖 This bot allows you to share files with users who join your channels.\n\n"
-            f"📤 Upload a file to get a shareable link\n"
-            f"🔗 Users must join your channels to download\n\n"
-            f"Use the buttons below to get started:"
-        )
         
         kb = [
             [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
@@ -430,12 +414,13 @@ class BotHandlers:
             [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
             [InlineKeyboardButton('❓ Help', callback_data='help')]
         ]
-        
         if self.is_admin(user_id):
             kb.append([InlineKeyboardButton('🛠 Admin Panel', callback_data='admin')])
         
         update.message.reply_text(
-            welcome_text,
+            f'👋 Welcome {first_name}!\n\n'
+            f'📤 Upload a file to get a shareable link\n'
+            f'🔗 Users must join your channels to download',
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML
         )
@@ -444,7 +429,6 @@ class BotHandlers:
     # CALLBACK HANDLER
     # ============================================
     def callback_handler(self, update: Update, context: CallbackContext):
-        """Handle callback queries"""
         query = update.callback_query
         query.answer()
         
@@ -462,12 +446,9 @@ class BotHandlers:
                 '   • Direct send: Max 50MB\n'
                 '   • Forward: Up to 2GB\n\n'
                 '🔗 <b>Manage Channels</b>: Add channels users must join\n'
-                '   • Users must join ALL your channels to download\n\n'
-                '📂 <b>My Files</b>: View and manage your uploaded files\n\n'
-                '🔐 <b>Required Channels</b>: Bot-wide required channels\n'
-                f'   {", ".join(c["name"] for c in REQUIRED_CHANNELS)}',
+                '📂 <b>My Files</b>: View and manage your uploaded files',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ]),
                 parse_mode=ParseMode.HTML
             )
@@ -485,12 +466,11 @@ class BotHandlers:
                 [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
                 [InlineKeyboardButton('❓ Help', callback_data='help')]
             ]
-            
             if self.is_admin(user_id):
                 kb.append([InlineKeyboardButton('🛠 Admin Panel', callback_data='admin')])
             
             query.edit_message_text(
-                f'👋 Welcome back {first_name}!\n\nChoose an option:',
+                f'👋 Welcome back {first_name}!',
                 reply_markup=InlineKeyboardMarkup(kb),
                 parse_mode=ParseMode.HTML
             )
@@ -505,10 +485,9 @@ class BotHandlers:
                 f'📊 <b>Statistics</b>\n\n'
                 f'👥 User ID: {user_id}\n'
                 f'📁 Your Files: {len(user_files)}\n'
-                f'📁 Total Files: {total_files or 0}\n\n'
-                f'🔐 Required Channels: {", ".join(c["name"] for c in REQUIRED_CHANNELS)}',
+                f'📁 Total Files: {total_files or 0}',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ]),
                 parse_mode=ParseMode.HTML
             )
@@ -520,25 +499,23 @@ class BotHandlers:
             
             if not files:
                 query.edit_message_text(
-                    '📂 No files uploaded yet.\n\nUpload a file to get started!',
+                    '📂 No files uploaded yet.',
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
-                        [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                        [InlineKeyboardButton('📤 Upload', callback_data='upload')],
+                        [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                     ])
                 )
                 return
             
             text = '📂 <b>Your Files</b>\n\n'
             btns = []
-            
             for f in files[:10]:
                 text += f'📄 {f["name"]}\n'
                 text += f'📦 {self.format_file_size(f["size"])}\n'
                 text += f'📥 {f["downloads"]} downloads\n'
                 text += f'🔗 https://t.me/{self.bot_username}?start={f["link_code"]}\n\n'
-                btns.append([InlineKeyboardButton(f'🗑 Delete: {f["name"][:15]}', callback_data=f'delete_{f["id"]}')])
-            
-            btns.append([InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')])
+                btns.append([InlineKeyboardButton(f'🗑 Delete', callback_data=f'delete_{f["id"]}')])
+            btns.append([InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')])
             
             query.edit_message_text(
                 text,
@@ -551,12 +528,11 @@ class BotHandlers:
         if data.startswith('delete_'):
             file_id = data.replace('delete_', '')
             self.db.delete_file(file_id)
-            
             query.edit_message_text(
-                '✅ File deleted successfully!',
+                '✅ File deleted!',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ])
             )
             return
@@ -565,23 +541,21 @@ class BotHandlers:
         if data == 'managechannels':
             channels = self.db.get_user_channels(user_id)
             
-            text = '🔗 <b>Manage Your Channels</b>\n\n'
+            text = '🔗 <b>Manage Channels</b>\n\n'
             kb = []
             
             if channels:
                 text += f'📋 Your channels ({len(channels)}):\n\n'
                 for ch in channels:
-                    type_icon = '🔒' if ch['channel_type'] == 'private' else '🌐'
-                    text += f'  {type_icon} {ch["channel_name"]}\n'
+                    text += f'  • {ch["channel_name"]}\n'
                     kb.append([InlineKeyboardButton(f'❌ Remove {ch["channel_name"]}', callback_data=f'remove_{ch["id"]}')])
             else:
                 text += '📭 No channels added yet.\n\n'
-                text += 'Add channels that users must join to download your files.\n\n'
                 text += '⚠️ You must add at least one channel to upload files.'
             
             kb.append([InlineKeyboardButton('➕ Add Public Channel', callback_data='addchannel')])
             kb.append([InlineKeyboardButton('🔒 Add Private Channel', callback_data='addprivate')])
-            kb.append([InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')])
+            kb.append([InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')])
             
             query.edit_message_text(
                 text,
@@ -596,10 +570,10 @@ class BotHandlers:
             self.db.remove_user_channel(user_id, channel_id)
             
             query.edit_message_text(
-                '✅ Channel removed successfully!',
+                '✅ Channel removed!',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ])
             )
             return
@@ -610,14 +584,12 @@ class BotHandlers:
             
             query.edit_message_text(
                 '🌐 <b>Add Public Channel</b>\n\n'
-                'Send your public channel username or link:\n\n'
+                'Send your public channel username:\n\n'
                 '• @my_channel\n'
                 '• https://t.me/my_channel\n'
                 '• my_channel\n\n'
-                f'⚠️ Requirements:\n'
-                f'• Bot must be an admin in the channel (@{self.bot_username})\n'
-                f'• Channel must be public\n\n'
-                f'Send /cancel to cancel',
+                f'⚠️ Bot must be admin in the channel (@{self.bot_username})\n\n'
+                'Send /cancel to cancel',
                 parse_mode=ParseMode.HTML
             )
             return
@@ -628,12 +600,9 @@ class BotHandlers:
             
             query.edit_message_text(
                 '🔒 <b>Add Private Channel</b>\n\n'
-                f'To add a private channel:\n\n'
-                f'1. Make sure @{self.bot_username} is an admin in the channel\n'
-                f'2. Forward ANY message from the channel to this bot\n'
-                f'3. The bot will auto-detect the channel\n\n'
-                f'This is the ONLY way to add private channels.\n\n'
-                f'Send /cancel to cancel',
+                f'1. Make sure @{self.bot_username} is admin\n'
+                f'2. Forward ANY message from the channel to this bot\n\n'
+                'Send /cancel to cancel',
                 parse_mode=ParseMode.HTML
             )
             return
@@ -645,11 +614,10 @@ class BotHandlers:
             if not user_channels:
                 query.edit_message_text(
                     '⚠️ <b>No channels added!</b>\n\n'
-                    'You must add at least one channel before uploading files.\n\n'
-                    'Users will need to join your channels to download your files.',
+                    'Add a channel first using "Manage Channels".',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
-                        [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                        [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                     ]),
                     parse_mode=ParseMode.HTML
                 )
@@ -662,8 +630,7 @@ class BotHandlers:
                 'Send or forward the file you want to share.\n\n'
                 '✅ Direct send: Max 50MB\n'
                 '🔄 Forward: Max 2GB\n\n'
-                f'📢 Users must join your {len(user_channels)} channel(s) to download.\n'
-                f'Channels: {", ".join(c["channel_name"] for c in user_channels)}\n\n'
+                f'📢 Users must join your {len(user_channels)} channel(s)\n'
                 'Send /cancel to cancel',
                 parse_mode=ParseMode.HTML
             )
@@ -672,7 +639,7 @@ class BotHandlers:
         # ---- ADMIN ----
         if data == 'admin':
             if not self.is_admin(user_id):
-                query.edit_message_text('❌ Access denied. Admin only.')
+                query.edit_message_text('❌ Access denied.')
                 return
             
             total_files = self.db.get_total_files()
@@ -680,72 +647,12 @@ class BotHandlers:
             query.edit_message_text(
                 f'🛠 <b>Admin Panel</b>\n\n'
                 f'📁 Total Files: {total_files or 0}\n'
-                f'👥 Admin ID: {user_id}\n'
-                f'🔐 Required Channels: {", ".join(c["name"] for c in REQUIRED_CHANNELS)}',
+                f'👥 Admin ID: {user_id}',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('📁 All Files', callback_data='admin_files')],
                     [InlineKeyboardButton('🗑 Cleanup Expired', callback_data='admin_cleanup')],
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ]),
                 parse_mode=ParseMode.HTML
-            )
-            return
-        
-        # ---- ADMIN FILES ----
-        if data == 'admin_files':
-            if not self.is_admin(user_id):
-                return
-            
-            files = self.db.get_user_files(user_id)
-            
-            if not files:
-                query.edit_message_text(
-                    '📂 No files found.',
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton('🔙 Back', callback_data='admin')]
-                    ])
-                )
-                return
-            
-            text = '📁 <b>All Files</b>\n\n'
-            btns = []
-            
-            for f in files[:20]:
-                text += f'📄 {f["name"]}\n'
-                text += f'📥 {f["downloads"]} downloads\n'
-                if f.get('expiry'):
-                    try:
-                        expiry_delta = (datetime.fromisoformat(f['expiry']) - datetime.fromisoformat(f['created_at'])).total_seconds()
-                        expiry_text = self.format_expiry(expiry_delta)
-                    except:
-                        expiry_text = 'Unknown'
-                else:
-                    expiry_text = '♾️ Permanent'
-                text += f'⏰ {expiry_text}\n\n'
-                btns.append([InlineKeyboardButton(f'🗑 Delete: {f["name"][:15]}', callback_data=f'admin_delete_{f["id"]}')])
-            
-            btns.append([InlineKeyboardButton('🔙 Back', callback_data='admin')])
-            
-            query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(btns),
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        # ---- ADMIN DELETE ----
-        if data.startswith('admin_delete_'):
-            if not self.is_admin(user_id):
-                return
-            
-            file_id = data.replace('admin_delete_', '')
-            self.db.delete_file(file_id)
-            
-            query.edit_message_text(
-                '✅ File deleted.',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('🔙 Back', callback_data='admin_files')]
-                ])
             )
             return
         
@@ -753,9 +660,7 @@ class BotHandlers:
         if data == 'admin_cleanup':
             if not self.is_admin(user_id):
                 return
-            
             count = self.db.cleanup_expired_files()
-            
             query.edit_message_text(
                 f'✅ Cleanup complete!\n\nRemoved {count} expired files.',
                 reply_markup=InlineKeyboardMarkup([
@@ -767,11 +672,10 @@ class BotHandlers:
         # ---- CANCEL ----
         if data == 'cancel':
             self.clear_session(user_id)
-            
             query.edit_message_text(
                 '❌ Cancelled.',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ])
             )
             return
@@ -780,25 +684,23 @@ class BotHandlers:
     # TEXT HANDLER
     # ============================================
     def text_handler(self, update: Update, context: CallbackContext):
-        """Handle text messages"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         text = update.message.text
         
-        logger.info(f'📨 Text message from user {user_id}: {text[:50] if text else "empty"}')
+        logger.info(f'📨 Text from user {user_id}: {text[:50] if text else "empty"}')
         
-        # Handle cancel
         if text and text.lower() == '/cancel':
             self.clear_session(user_id)
             update.message.reply_text(
                 '❌ Cancelled.',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ])
             )
             return
         
-        # Handle private channel detection via forwarded message
+        # Handle private channel detection
         if update.message.forward_from_chat:
             session = self.get_session(user_id)
             if session and session.get('step') == 'waiting_private_channel':
@@ -815,27 +717,32 @@ class BotHandlers:
     # FILE HANDLER
     # ============================================
     def file_handler(self, update: Update, context: CallbackContext):
-        """Handle file uploads"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         msg = update.message
         
         logger.info(f'📨 File received from user {user_id}')
         
-        # Check if user has an active session
+        # Log file details
+        if msg.document:
+            logger.info(f'   Document: {msg.document.file_name} ({msg.document.file_size} bytes)')
+        elif msg.photo:
+            logger.info(f'   Photo: {msg.photo[-1].file_size} bytes')
+        elif msg.video:
+            logger.info(f'   Video: {msg.video.file_name} ({msg.video.file_size} bytes)')
+        
         session = self.get_session(user_id)
         if not session or session.get('step') != 'waiting_file':
             msg.reply_text(
                 '⚠️ Please use the "Upload File" button first.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ])
             )
             return
         
         # Get file info
-        file = None
         file_name = None
         file_size = 0
         file_id = None
@@ -855,25 +762,22 @@ class BotHandlers:
         
         # Get file based on type
         if msg.document:
-            file = msg.document
-            file_name = file.file_name or 'document'
-            file_size = file.file_size
-            file_id = file.file_id
+            file_name = msg.document.file_name or 'document'
+            file_size = msg.document.file_size
+            file_id = msg.document.file_id
         elif msg.photo:
-            file = msg.photo[-1]
             file_name = f'photo_{int(datetime.now().timestamp())}.jpg'
-            file_size = file.file_size
-            file_id = file.file_id
+            file_size = msg.photo[-1].file_size
+            file_id = msg.photo[-1].file_id
         elif msg.video:
-            file = msg.video
-            file_name = file.file_name or 'video.mp4'
-            file_size = file.file_size
-            file_id = file.file_id
+            file_name = msg.video.file_name or 'video.mp4'
+            file_size = msg.video.file_size
+            file_id = msg.video.file_id
         else:
             msg.reply_text('❌ Please send a document, photo, or video.')
             return
         
-        # Check size limit for direct sends
+        # Check size limit
         if not is_forwarded and file_size > MAX_FILE_SIZE_SEND:
             msg.reply_text(
                 f'❌ File too large ({self.format_file_size(file_size)}).\n\n'
@@ -889,7 +793,7 @@ class BotHandlers:
                 '⚠️ No channels found! Please add a channel first.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
-                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
                 ])
             )
             self.clear_session(user_id)
@@ -903,12 +807,12 @@ class BotHandlers:
             'user_id': user_id,
             'name': file_name,
             'size': file_size,
-            'mime_type': file.mime_type if file else '',
+            'mime_type': msg.document.mime_type if msg.document else '',
             'file_id': file_id,
             'from_chat_id': from_chat_id,
             'original_message_id': original_message_id,
             'is_forwarded': 1 if is_forwarded else 0,
-            'expiry': None  # Permanent by default
+            'expiry': None
         }
         
         result = self.db.create_file(file_data)
@@ -917,28 +821,24 @@ class BotHandlers:
         for ch in user_channels:
             self.db.add_file_channel(result['id'], ch['id'])
         
-        # Clear session
         self.clear_session(user_id)
         
-        # Generate shareable link
+        # Generate link
         link = f'https://t.me/{self.bot_username}?start={result["link_code"]}'
-        
-        # Create channel list for display
         channel_list = '\n'.join(f'• {ch["channel_name"]}' for ch in user_channels)
         
         msg.reply_text(
-            f'✅ <b>File Uploaded Successfully!</b>\n\n'
-            f'📄 <b>File:</b> {file_name}\n'
-            f'📦 <b>Size:</b> {self.format_file_size(file_size)}\n'
-            f'📢 <b>Channels:</b> {len(user_channels)} channel(s)\n\n'
-            f'🔗 <b>Shareable Link:</b>\n'
+            f'✅ <b>File Uploaded!</b>\n\n'
+            f'📄 {file_name}\n'
+            f'📦 {self.format_file_size(file_size)}\n'
+            f'📢 Channels: {len(user_channels)}\n\n'
+            f'🔗 Shareable Link:\n'
             f'<code>{link}</code>\n\n'
-            f'📋 <b>Required Channels:</b>\n{channel_list}\n\n'
-            f'⚠️ Users must join ALL these channels to download your file.',
+            f'📋 Required Channels:\n{channel_list}',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('📤 Upload More', callback_data='upload')],
                 [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
-                [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
             ]),
             parse_mode=ParseMode.HTML
         )
@@ -947,7 +847,6 @@ class BotHandlers:
     # PRIVATE CHANNEL DETECTION
     # ============================================
     def handle_private_channel_detection(self, update: Update, context: CallbackContext):
-        """Handle private channel detection from forwarded message"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         msg = update.message
@@ -960,33 +859,32 @@ class BotHandlers:
         channel_title = chat.title or 'Private Channel'
         channel_username = chat.username
         
+        logger.info(f'🔒 Private channel detection: {channel_title} ({channel_id})')
+        
         # Check if bot is admin
         try:
             member = context.bot.get_chat_member(channel_id, self.bot_id)
             if member.status not in ['administrator', 'creator']:
                 msg.reply_text(
                     f'❌ Bot is not an admin in "{channel_title}".\n\n'
-                    f'Please add @{self.bot_username} as an admin and try again.'
+                    f'Please add @{self.bot_username} as an admin.'
                 )
                 return
         except Exception as e:
             msg.reply_text(
                 f'❌ Could not verify bot admin status.\n\n'
-                f'Please make sure @{self.bot_username} is an admin in the channel.'
+                f'Please make sure @{self.bot_username} is an admin.'
             )
             return
         
-        # Check if channel already exists
+        # Check if channel exists
         existing = self.db.get_user_channels(user_id)
         if any(c['channel_id'] == channel_id for c in existing):
-            msg.reply_text(
-                f'⚠️ This channel is already in your list.\n\n'
-                f'📢 {channel_title}'
-            )
+            msg.reply_text(f'⚠️ Channel "{channel_title}" is already in your list.')
             self.clear_session(user_id)
             return
         
-        # Try to create invite link
+        # Create invite link
         link = None
         try:
             invite_link = context.bot.create_chat_invite_link(channel_id, member_limit=0)
@@ -1018,7 +916,7 @@ class BotHandlers:
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
                 [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
-                [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
             ]),
             parse_mode=ParseMode.HTML
         )
@@ -1027,7 +925,6 @@ class BotHandlers:
     # PUBLIC CHANNEL ADD
     # ============================================
     def handle_public_channel_add(self, update: Update, context: CallbackContext):
-        """Handle public channel addition"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         text = update.message.text
@@ -1040,7 +937,9 @@ class BotHandlers:
         else:
             channel_name = text.strip()
         
-        # Check if channel exists and bot is admin
+        logger.info(f'🌐 Public channel add: @{channel_name}')
+        
+        # Check if channel exists
         try:
             chat = context.bot.get_chat(f'@{channel_name}')
             channel_id = chat.id
@@ -1049,8 +948,7 @@ class BotHandlers:
             member = context.bot.get_chat_member(channel_id, self.bot_id)
             if member.status not in ['administrator', 'creator']:
                 update.message.reply_text(
-                    f'❌ Bot is not an admin in @{channel_name}.\n\n'
-                    f'Please add @{self.bot_username} as an admin and try again.',
+                    f'❌ Bot is not an admin in @{channel_name}.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('🔄 Try Again', callback_data='addchannel')],
                         [InlineKeyboardButton('❌ Cancel', callback_data='cancel')]
@@ -1059,8 +957,7 @@ class BotHandlers:
                 return
         except Exception as e:
             update.message.reply_text(
-                f'❌ Could not find channel @{channel_name}.\n\n'
-                f'Please make sure the channel exists and is public.',
+                f'❌ Could not find channel @{channel_name}.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔄 Try Again', callback_data='addchannel')],
                     [InlineKeyboardButton('❌ Cancel', callback_data='cancel')]
@@ -1068,7 +965,7 @@ class BotHandlers:
             )
             return
         
-        # Check if channel already exists
+        # Check if exists
         existing = self.db.get_user_channels(user_id)
         if any(c['channel_id'] == channel_id for c in existing):
             update.message.reply_text('⚠️ This channel is already in your list.')
@@ -1094,7 +991,7 @@ class BotHandlers:
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
                 [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
-                [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
             ]),
             parse_mode=ParseMode.HTML
         )
@@ -1116,7 +1013,6 @@ async def start_health_server():
     logger.info(f"✅ Health check server running on port {PORT}")
 
 def run_health_server():
-    """Run health check server in a separate thread"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(start_health_server())
@@ -1127,30 +1023,24 @@ def run_health_server():
 # MAIN
 # ============================================
 def main():
-    """Main entry point"""
     logger.info('🚀 Starting bot...')
     
-    # Initialize database
     db = Database()
     handlers = BotHandlers(db)
     
-    # Create updater
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
     
-    # Store bot info
     bot_info = updater.bot.get_me()
     handlers.bot_username = bot_info.username
     handlers.bot_id = bot_info.id
     logger.info(f'✅ Bot running: @{handlers.bot_username}')
     logger.info(f'🆔 Bot ID: {handlers.bot_id}')
     
-    # Set commands
     updater.bot.set_my_commands([
         ('start', '🚀 Start the bot'),
     ])
     
-    # Add handlers
     dp.add_handler(CommandHandler('start', handlers.start_command))
     dp.add_handler(MessageHandler(Filters.document, handlers.file_handler))
     dp.add_handler(MessageHandler(Filters.photo, handlers.file_handler))
@@ -1160,7 +1050,7 @@ def main():
     
     logger.info('✅ Bot is ready!')
     
-    # Start health check server in background thread
+    # Start health check server
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     
@@ -1168,10 +1058,8 @@ def main():
     updater.start_polling()
     logger.info('🔄 Polling started...')
     
-    # Keep the bot running
     updater.idle()
     
-    # Cleanup
     db.close()
     logger.info('🛑 Bot stopped')
 
