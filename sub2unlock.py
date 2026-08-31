@@ -2,6 +2,7 @@
 # ============================================
 # TELEGRAM FILE SHARING BOT - PRODUCTION READY
 # Full Complete Code - Fixed for Render Deployment
+# Fixes: Event loop conflict and Updater error
 # ============================================
 
 import os
@@ -23,6 +24,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
+from aiohttp import web
 
 # Load environment variables
 load_dotenv()
@@ -34,6 +36,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
 DB_PATH = os.getenv('DB_PATH', './data/bot_database.db')
 MAX_FILE_SIZE_SEND = 50 * 1024 * 1024  # 50MB for direct send
+PORT = int(os.getenv('PORT', 10000))
 
 if not BOT_TOKEN:
     print('❌ BOT_TOKEN is not set in environment variables')
@@ -1696,7 +1699,7 @@ class BotHandlers:
         # Create file in database
         unique_id = secrets.token_hex(16)
         
-        # Check if user has channels, if not, use a default
+        # Check if user has channels
         user_channels = await self.db.get_user_channels(user_id)
         
         # Store in session for channel selection
@@ -1712,12 +1715,11 @@ class BotHandlers:
                 'original_message_id': original_message_id,
                 'is_forwarded': is_forwarded
             },
-            'selected_channels': [ch['id'] for ch in user_channels]  # Auto-select all channels
+            'selected_channels': [ch['id'] for ch in user_channels]
         }
 
         # If user has channels, go to expiry directly
         if user_channels:
-            # Create file directly with all channels
             file_data = {
                 'id': unique_id,
                 'user_id': user_id,
@@ -1733,7 +1735,6 @@ class BotHandlers:
 
             result = await self.db.create_file(file_data)
 
-            # Add file-channel associations
             for ch in user_channels:
                 await self.db.add_file_channel(result['id'], ch['id'])
 
@@ -1757,21 +1758,38 @@ class BotHandlers:
                 parse_mode=ParseMode.HTML
             )
         else:
-            # No channels, show channel selection
             await self.show_channel_selection(chat_id, user_id)
 
 
 # ============================================
-# MAIN - VERIFIED FIX
+# HEALTH CHECK SERVER
+# ============================================
+async def health_check(request):
+    """Health check endpoint for Render"""
+    return web.Response(text="OK", status=200)
+
+async def start_health_server():
+    """Start the health check server"""
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"✅ Health check server running on port {PORT}")
+
+
+# ============================================
+# MAIN - FIXED FOR EVENT LOOP CONFLICT
 # ============================================
 async def main():
-    """Main entry point with verified fix"""
+    """Main entry point with event loop fix"""
     logger.info('🚀 Starting bot...')
 
     db = Database()
     handlers = BotHandlers(db)
 
-    # Build application with timeouts to prevent hanging
+    # Build application
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1780,7 +1798,6 @@ async def main():
         .build()
     )
 
-    # Store application reference
     handlers.application = application
 
     # Add handlers
@@ -1798,54 +1815,53 @@ async def main():
     logger.info(f'✅ Bot running: @{handlers.bot_username}')
     logger.info(f'🆔 Bot ID: {handlers.bot_id}')
 
-    logger.info('\n🔐 Required Channels (Bot-wide):')
-    for ch in REQUIRED_CHANNELS:
-        if ch['channel_id']:
-            logger.info(f'  ✅ {ch["name"]} ({ch["type"]}) - ID: {ch["channel_id"]}')
-        else:
-            logger.info(f'  ⏳ {ch["name"]} ({ch["type"]}) - Will auto-detect')
-
     # Set bot commands
     await application.bot.set_my_commands([
         ('start', '🚀 Start the bot'),
     ])
 
-    logger.info('\n✅ Bot is ready!')
-    logger.info(f'\n👑 Admins: {", ".join(str(a) for a in ADMIN_IDS) if ADMIN_IDS else "None"}')
+    logger.info('✅ Bot is ready!')
+
+    # Start health check server
+    await start_health_server()
 
     # ============================================
-    # CRITICAL FIX: Use the correct polling method with fallback
+    # FIX: Use run_polling with correct event loop handling
     # ============================================
     try:
-        # Primary method for v20.x
         await application.run_polling(
             poll_interval=0.5,
             timeout=10,
             read_timeout=30,
             connect_timeout=30,
-            allowed_updates=["message", "callback_query"]
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True
         )
-    except AttributeError as e:
-        # Fallback for older versions or edge cases
-        if "_Updater__polling_cleanup_cb" in str(e):
-            logger.warning("⚠️ Detected library version mismatch. Attempting fallback...")
-            # Alternative initialization method
+    except RuntimeError as e:
+        if "already running" in str(e):
+            logger.warning("⚠️ Event loop already running, using alternative method...")
+            # Alternative: initialize and start manually
             await application.initialize()
             await application.start()
+            # Start polling with a custom loop
             await application.updater.start_polling(
                 poll_interval=0.5,
                 timeout=10,
                 read_timeout=30,
                 connect_timeout=30,
-                allowed_updates=["message", "callback_query"]
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True
             )
-            # Keep the bot running
+            # Keep running
             while True:
                 await asyncio.sleep(1)
         else:
             raise
 
 
+# ============================================
+# ENTRY POINT
+# ============================================
 if __name__ == '__main__':
     try:
         asyncio.run(main())
