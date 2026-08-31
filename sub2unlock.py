@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================
-# TELEGRAM FILE SHARING BOT - WORKING VERSION
-# Compatible with python-telegram-bot 13.7
+# TELEGRAM FILE SHARING BOT - COMPLETE WORKING VERSION
+# Fixed: All sessions properly processed
 # ============================================
 
 import os
@@ -11,11 +11,11 @@ import secrets
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ParseMode, Bot, ChatMember
+    ParseMode
 )
 from telegram.ext import (
     Updater, CommandHandler, CallbackQueryHandler,
@@ -342,14 +342,14 @@ class Database:
 
 
 # ============================================
-# BOT HANDLERS
+# BOT HANDLERS CLASS
 # ============================================
 class BotHandlers:
     def __init__(self, db: Database):
         self.db = db
         self.bot_username = ''
         self.bot_id = 0
-        self.sessions = {}
+        self.sessions = {}  # user_id -> session data
 
     def format_file_size(self, bytes: int) -> str:
         if bytes < 1024:
@@ -380,6 +380,24 @@ class BotHandlers:
     def is_admin(self, user_id: int) -> bool:
         return user_id in ADMIN_IDS
 
+    def get_session(self, user_id: int) -> Optional[Dict]:
+        """Get session for user, remove if expired (> 1 hour)"""
+        session = self.sessions.get(user_id)
+        if session and session.get('created_at'):
+            if (datetime.now() - session['created_at']).seconds > 3600:
+                self.sessions.pop(user_id, None)
+                return None
+        return session
+
+    def set_session(self, user_id: int, data: Dict):
+        """Set session for user with timestamp"""
+        data['created_at'] = datetime.now()
+        self.sessions[user_id] = data
+
+    def clear_session(self, user_id: int):
+        """Clear session for user"""
+        self.sessions.pop(user_id, None)
+
     # ============================================
     # START COMMAND
     # ============================================
@@ -393,6 +411,9 @@ class BotHandlers:
         
         # Create user in database
         self.db.create_user(user_id, update.effective_user.username or '', first_name)
+        
+        # Clear any existing session
+        self.clear_session(user_id)
         
         # Show welcome message
         welcome_text = (
@@ -456,6 +477,7 @@ class BotHandlers:
         if data == 'back_to_menu':
             user = self.db.get_user(user_id)
             first_name = user['first_name'] if user else 'User'
+            self.clear_session(user_id)
             
             kb = [
                 [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
@@ -584,7 +606,7 @@ class BotHandlers:
         
         # ---- ADD PUBLIC CHANNEL ----
         if data == 'addchannel':
-            self.sessions[user_id] = {'step': 'waiting_public_channel'}
+            self.set_session(user_id, {'step': 'waiting_public_channel'})
             
             query.edit_message_text(
                 '🌐 <b>Add Public Channel</b>\n\n'
@@ -602,7 +624,7 @@ class BotHandlers:
         
         # ---- ADD PRIVATE CHANNEL ----
         if data == 'addprivate':
-            self.sessions[user_id] = {'step': 'waiting_private_channel'}
+            self.set_session(user_id, {'step': 'waiting_private_channel'})
             
             query.edit_message_text(
                 '🔒 <b>Add Private Channel</b>\n\n'
@@ -633,7 +655,7 @@ class BotHandlers:
                 )
                 return
             
-            self.sessions[user_id] = {'step': 'waiting_file'}
+            self.set_session(user_id, {'step': 'waiting_file'})
             
             query.edit_message_text(
                 '📤 <b>Upload Your File</b>\n\n'
@@ -674,7 +696,6 @@ class BotHandlers:
             if not self.is_admin(user_id):
                 return
             
-            # Get all files (simplified - just get user's files)
             files = self.db.get_user_files(user_id)
             
             if not files:
@@ -745,7 +766,7 @@ class BotHandlers:
         
         # ---- CANCEL ----
         if data == 'cancel':
-            self.sessions.pop(user_id, None)
+            self.clear_session(user_id)
             
             query.edit_message_text(
                 '❌ Cancelled.',
@@ -768,7 +789,7 @@ class BotHandlers:
         
         # Handle cancel
         if text and text.lower() == '/cancel':
-            self.sessions.pop(user_id, None)
+            self.clear_session(user_id)
             update.message.reply_text(
                 '❌ Cancelled.',
                 reply_markup=InlineKeyboardMarkup([
@@ -777,18 +798,18 @@ class BotHandlers:
             )
             return
         
-        # Handle public channel add
-        session = self.sessions.get(user_id)
-        if session and session.get('step') == 'waiting_public_channel' and text:
-            self.handle_public_channel_add(update, context)
-            return
-        
         # Handle private channel detection via forwarded message
         if update.message.forward_from_chat:
-            session = self.sessions.get(user_id)
+            session = self.get_session(user_id)
             if session and session.get('step') == 'waiting_private_channel':
                 self.handle_private_channel_detection(update, context)
                 return
+        
+        # Handle public channel add
+        session = self.get_session(user_id)
+        if session and session.get('step') == 'waiting_public_channel' and text:
+            self.handle_public_channel_add(update, context)
+            return
 
     # ============================================
     # FILE HANDLER
@@ -799,9 +820,10 @@ class BotHandlers:
         chat_id = update.effective_chat.id
         msg = update.message
         
-        logger.info(f'📨 File from user {user_id}')
+        logger.info(f'📨 File received from user {user_id}')
         
-        session = self.sessions.get(user_id)
+        # Check if user has an active session
+        session = self.get_session(user_id)
         if not session or session.get('step') != 'waiting_file':
             msg.reply_text(
                 '⚠️ Please use the "Upload File" button first.',
@@ -859,9 +881,22 @@ class BotHandlers:
             )
             return
         
+        # Get user's channels
+        user_channels = self.db.get_user_channels(user_id)
+        
+        if not user_channels:
+            msg.reply_text(
+                '⚠️ No channels found! Please add a channel first.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
+                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                ])
+            )
+            self.clear_session(user_id)
+            return
+        
         # Create file in database
         unique_id = secrets.token_hex(16)
-        user_channels = self.db.get_user_channels(user_id)
         
         file_data = {
             'id': unique_id,
@@ -872,8 +907,8 @@ class BotHandlers:
             'file_id': file_id,
             'from_chat_id': from_chat_id,
             'original_message_id': original_message_id,
-            'is_forwarded': is_forwarded,
-            'expiry': None
+            'is_forwarded': 1 if is_forwarded else 0,
+            'expiry': None  # Permanent by default
         }
         
         result = self.db.create_file(file_data)
@@ -882,18 +917,24 @@ class BotHandlers:
         for ch in user_channels:
             self.db.add_file_channel(result['id'], ch['id'])
         
-        self.sessions.pop(user_id, None)
+        # Clear session
+        self.clear_session(user_id)
         
+        # Generate shareable link
         link = f'https://t.me/{self.bot_username}?start={result["link_code"]}'
         
+        # Create channel list for display
+        channel_list = '\n'.join(f'• {ch["channel_name"]}' for ch in user_channels)
+        
         msg.reply_text(
-            f'✅ <b>File Uploaded!</b>\n\n'
-            f'📄 {file_name}\n'
-            f'📦 {self.format_file_size(file_size)}\n'
-            f'⏰ ♾️ Permanent\n'
-            f'📢 Channels: {len(user_channels)} channel(s)\n\n'
-            f'🔗 Shareable Link:\n'
-            f'{link}',
+            f'✅ <b>File Uploaded Successfully!</b>\n\n'
+            f'📄 <b>File:</b> {file_name}\n'
+            f'📦 <b>Size:</b> {self.format_file_size(file_size)}\n'
+            f'📢 <b>Channels:</b> {len(user_channels)} channel(s)\n\n'
+            f'🔗 <b>Shareable Link:</b>\n'
+            f'<code>{link}</code>\n\n'
+            f'📋 <b>Required Channels:</b>\n{channel_list}\n\n'
+            f'⚠️ Users must join ALL these channels to download your file.',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('📤 Upload More', callback_data='upload')],
                 [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
@@ -942,7 +983,7 @@ class BotHandlers:
                 f'⚠️ This channel is already in your list.\n\n'
                 f'📢 {channel_title}'
             )
-            self.sessions.pop(user_id, None)
+            self.clear_session(user_id)
             return
         
         # Try to create invite link
@@ -965,7 +1006,7 @@ class BotHandlers:
             'link': link
         })
         
-        self.sessions.pop(user_id, None)
+        self.clear_session(user_id)
         channels = self.db.get_user_channels(user_id)
         
         msg.reply_text(
@@ -1031,7 +1072,7 @@ class BotHandlers:
         existing = self.db.get_user_channels(user_id)
         if any(c['channel_id'] == channel_id for c in existing):
             update.message.reply_text('⚠️ This channel is already in your list.')
-            self.sessions.pop(user_id, None)
+            self.clear_session(user_id)
             return
         
         # Add channel
@@ -1042,7 +1083,7 @@ class BotHandlers:
             'link': f'https://t.me/{channel_name}'
         })
         
-        self.sessions.pop(user_id, None)
+        self.clear_session(user_id)
         channels = self.db.get_user_channels(user_id)
         
         update.message.reply_text(
@@ -1120,7 +1161,6 @@ def main():
     logger.info('✅ Bot is ready!')
     
     # Start health check server in background thread
-    import threading
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     
