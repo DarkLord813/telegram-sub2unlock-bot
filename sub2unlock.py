@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================
 # TELEGRAM FILE SHARING BOT - WORKING VERSION
-# Fully functional with proper message handling
+# Compatible with python-telegram-bot 13.7
 # ============================================
 
 import os
@@ -14,14 +14,17 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ParseMode, Bot, ChatMember
 )
 from telegram.ext import (
     Updater, CommandHandler, CallbackQueryHandler,
     MessageHandler, Filters, CallbackContext
 )
-from telegram.constants import ParseMode
 from dotenv import load_dotenv
+from aiohttp import web
+import asyncio
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +36,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
 DB_PATH = os.getenv('DB_PATH', './data/bot_database.db')
 MAX_FILE_SIZE_SEND = 50 * 1024 * 1024  # 50MB for direct send
+PORT = int(os.getenv('PORT', 10000))
 
 if not BOT_TOKEN:
     print('❌ BOT_TOKEN is not set in environment variables')
@@ -688,7 +692,15 @@ class BotHandlers:
             for f in files[:20]:
                 text += f'📄 {f["name"]}\n'
                 text += f'📥 {f["downloads"]} downloads\n'
-                text += f'⏰ {self.format_expiry((datetime.fromisoformat(f["expiry"]) - datetime.fromisoformat(f["created_at"])).total_seconds()) if f["expiry"] else "♾️ Permanent"}\n\n'
+                if f.get('expiry'):
+                    try:
+                        expiry_delta = (datetime.fromisoformat(f['expiry']) - datetime.fromisoformat(f['created_at'])).total_seconds()
+                        expiry_text = self.format_expiry(expiry_delta)
+                    except:
+                        expiry_text = 'Unknown'
+                else:
+                    expiry_text = '♾️ Permanent'
+                text += f'⏰ {expiry_text}\n\n'
                 btns.append([InlineKeyboardButton(f'🗑 Delete: {f["name"][:15]}', callback_data=f'admin_delete_{f["id"]}')])
             
             btns.append([InlineKeyboardButton('🔙 Back', callback_data='admin')])
@@ -752,7 +764,7 @@ class BotHandlers:
         chat_id = update.effective_chat.id
         text = update.message.text
         
-        logger.info(f'📨 Text message from user {user_id}: {text[:50]}')
+        logger.info(f'📨 Text message from user {user_id}: {text[:50] if text else "empty"}')
         
         # Handle cancel
         if text and text.lower() == '/cancel':
@@ -1050,9 +1062,6 @@ class BotHandlers:
 # ============================================
 # HEALTH CHECK SERVER
 # ============================================
-import asyncio
-from aiohttp import web
-
 async def health_check(request):
     return web.Response(text="OK", status=200)
 
@@ -1061,9 +1070,9 @@ async def start_health_server():
     app.router.add_get('/health', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 10000)))
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"✅ Health check server running on port {os.getenv('PORT', 10000)}")
+    logger.info(f"✅ Health check server running on port {PORT}")
 
 def run_health_server():
     """Run health check server in a separate thread"""
@@ -1085,7 +1094,7 @@ def main():
     handlers = BotHandlers(db)
     
     # Create updater
-    updater = Updater(BOT_TOKEN)
+    updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
     
     # Store bot info
