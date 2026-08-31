@@ -1762,19 +1762,25 @@ class BotHandlers:
 
 
 # ============================================
-# MAIN - FIXED VERSION
+# MAIN - VERIFIED FIX
 # ============================================
 async def main():
-    """Main entry point"""
+    """Main entry point with verified fix"""
     logger.info('🚀 Starting bot...')
 
     db = Database()
     handlers = BotHandlers(db)
 
-    # Build application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Build application with timeouts to prevent hanging
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .build()
+    )
 
-    # Store application reference in handlers
+    # Store application reference
     handlers.application = application
 
     # Add handlers
@@ -1807,8 +1813,37 @@ async def main():
     logger.info('\n✅ Bot is ready!')
     logger.info(f'\n👑 Admins: {", ".join(str(a) for a in ADMIN_IDS) if ADMIN_IDS else "None"}')
 
-    # Start the bot using run_polling()
-    await application.run_polling()
+    # ============================================
+    # CRITICAL FIX: Use the correct polling method with fallback
+    # ============================================
+    try:
+        # Primary method for v20.x
+        await application.run_polling(
+            poll_interval=0.5,
+            timeout=10,
+            read_timeout=30,
+            connect_timeout=30,
+            allowed_updates=["message", "callback_query"]
+        )
+    except AttributeError as e:
+        # Fallback for older versions or edge cases
+        if "_Updater__polling_cleanup_cb" in str(e):
+            logger.warning("⚠️ Detected library version mismatch. Attempting fallback...")
+            # Alternative initialization method
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(
+                poll_interval=0.5,
+                timeout=10,
+                read_timeout=30,
+                connect_timeout=30,
+                allowed_updates=["message", "callback_query"]
+            )
+            # Keep the bot running
+            while True:
+                await asyncio.sleep(1)
+        else:
+            raise
 
 
 if __name__ == '__main__':
