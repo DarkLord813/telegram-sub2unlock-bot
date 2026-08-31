@@ -367,6 +367,15 @@ class Database:
         self.conn.commit()
         return cursor.rowcount
 
+    def add_file_channel(self, file_id: str, channel_id: int):
+        """Add file-channel association"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO file_channels (file_id, channel_id) VALUES (?, ?)',
+            (file_id, channel_id)
+        )
+        self.conn.commit()
+
     def close(self):
         """Close database connection"""
         if self.conn:
@@ -382,6 +391,7 @@ class BotHandlers:
         self.bot_username = ''
         self.bot_id = 0
         self.sessions = {}
+        self.application = None
 
     # ============================================
     # HELPER METHODS
@@ -419,18 +429,132 @@ class BotHandlers:
         """Check if user is admin"""
         return user_id in ADMIN_IDS
 
-    async def is_user_member_of_channel(self, user_id: int, channel_id: int, application) -> bool:
+    async def is_user_member_of_channel(self, user_id: int, channel_id: int) -> bool:
         """Check if user is member of channel"""
         try:
-            member = await application.bot.get_chat_member(channel_id, user_id)
+            member = await self.application.bot.get_chat_member(channel_id, user_id)
             return member.status in ['member', 'administrator', 'creator']
         except Exception:
             return False
 
+    async def create_invite_link(self, channel_id: int) -> Optional[str]:
+        """Create an invite link for a channel"""
+        try:
+            invite_link = await self.application.bot.create_chat_invite_link(
+                channel_id, member_limit=0
+            )
+            return invite_link.invite_link
+        except Exception as e:
+            logger.warning(f'⚠️ Could not create invite link: {e}')
+            return None
+
+    async def get_channel_link(self, channel_name: str, channel_info: Dict) -> str:
+        """Get channel link"""
+        if (channel_info and channel_info.get('link') and
+            channel_info['link'] != 'https://t.me/+[INVITE_CODE]' and
+            '[INVITE_CODE]' not in channel_info['link']):
+            return channel_info['link']
+
+        if channel_name.startswith('+') and channel_info and channel_info.get('channel_id'):
+            invite_link = await self.create_invite_link(channel_info['channel_id'])
+            if invite_link:
+                await self.db.update_channel_link(channel_name, invite_link)
+                return invite_link
+            return f'https://t.me/{channel_name}'
+
+        if channel_name.startswith('@'):
+            return f'https://t.me/{channel_name[1:]}'
+
+        return f'https://t.me/{channel_name}'
+
+    async def is_bot_admin_in_channel(self, channel_id: int) -> bool:
+        """Check if bot is admin in channel"""
+        try:
+            member = await self.application.bot.get_chat_member(channel_id, self.bot_id)
+            return member.status in ['administrator', 'creator']
+        except Exception:
+            return False
+
+    # ============================================
+    # DETECT CHANNELS
+    # ============================================
+    async def detect_private_channel_from_forward(self, msg) -> Dict:
+        """Detect private channel from forwarded message"""
+        forward_from_chat = msg.forward_from_chat
+        if not forward_from_chat:
+            return {'success': False, 'error': '❌ Not a forwarded message'}
+
+        channel_id = forward_from_chat.id
+        channel_title = forward_from_chat.title or 'Private Channel'
+        channel_username = forward_from_chat.username
+
+        is_admin = await self.is_bot_admin_in_channel(channel_id)
+
+        if not is_admin:
+            return {
+                'success': False,
+                'error': f'❌ Bot is not an admin in "{channel_title}".\n\nPlease add @{self.bot_username} as an admin.'
+            }
+
+        link = await self.create_invite_link(channel_id)
+
+        if not link:
+            if channel_username:
+                link = f'https://t.me/{channel_username}'
+            else:
+                link = 'https://t.me/+[INVITE_CODE]'
+
+        return {
+            'success': True,
+            'channel_id': channel_id,
+            'title': channel_title,
+            'username': channel_username,
+            'type': 'private',
+            'link': link
+        }
+
+    async def detect_public_channel(self, identifier: str) -> Dict:
+        """Detect public channel from identifier"""
+        try:
+            chat_info = None
+            clean_id = identifier.replace('@', '').strip()
+
+            try:
+                chat_info = await self.application.bot.get_chat(f'@{clean_id}')
+            except Exception:
+                try:
+                    chat_info = await self.application.bot.get_chat(clean_id)
+                except Exception:
+                    match = re.search(r't\.me/(.+)', identifier)
+                    if match:
+                        username = match.group(1)
+                        chat_info = await self.application.bot.get_chat(f'@{username}')
+                        clean_id = username
+
+            if not chat_info or not chat_info.id:
+                return {'success': False, 'error': '❌ Channel not found.'}
+
+            is_admin = await self.is_bot_admin_in_channel(chat_info.id)
+            if not is_admin:
+                return {
+                    'success': False,
+                    'error': f'❌ Bot is not an admin in @{clean_id}. Please add @{self.bot_username} as admin.'
+                }
+
+            return {
+                'success': True,
+                'channel_id': chat_info.id,
+                'title': chat_info.title or clean_id,
+                'type': 'public',
+                'link': f'https://t.me/{clean_id}'
+            }
+        except Exception as e:
+            return {'success': False, 'error': f'❌ Error: {str(e)}'}
+
     # ============================================
     # CHECK REQUIRED CHANNELS
     # ============================================
-    async def check_all_required_channels(self, user_id: int, application) -> List[Dict]:
+    async def check_all_required_channels(self, user_id: int) -> List[Dict]:
         """Check if user has joined all required channels"""
         results = []
 
@@ -438,8 +562,19 @@ class BotHandlers:
             joined = False
             channel_id = channel['channel_id']
 
+            if channel['type'] == 'public' and not channel_id:
+                try:
+                    detection = await self.detect_public_channel(channel['identifier'])
+                    if detection['success']:
+                        channel_id = detection['channel_id']
+                        channel['channel_id'] = channel_id
+                        await self.db.update_required_channel_id(channel['name'], channel_id)
+                        logger.info(f'✅ Detected channel ID for {channel["name"]}: {channel_id}')
+                except Exception as e:
+                    logger.warning(f'⚠️ Could not detect {channel["name"]}: {e}')
+
             if channel_id:
-                joined = await self.is_user_member_of_channel(user_id, channel_id, application)
+                joined = await self.is_user_member_of_channel(user_id, channel_id)
 
             results.append({
                 'channel': channel['name'],
@@ -451,9 +586,9 @@ class BotHandlers:
 
         return results
 
-    async def force_join_required_channels(self, chat_id: int, user_id: int, application) -> bool:
+    async def force_join_required_channels(self, chat_id: int, user_id: int) -> bool:
         """Force user to join required channels"""
-        channel_status = await self.check_all_required_channels(user_id, application)
+        channel_status = await self.check_all_required_channels(user_id)
         all_joined = all(c['joined'] for c in channel_status)
 
         if all_joined:
@@ -465,14 +600,18 @@ class BotHandlers:
 
         for ch in channel_status:
             if not ch['joined']:
-                kb.append([InlineKeyboardButton(f'📢 Join {ch["channel"]}', url=ch['link'])])
+                link = await self.get_channel_link(ch['channel'], {
+                    'channel_id': ch['channel_id'],
+                    'link': ch['link']
+                })
+                kb.append([InlineKeyboardButton(f'📢 Join {ch["channel"]}', url=link)])
                 missing_channels.append(ch['channel'])
 
         kb.append([InlineKeyboardButton("✅ I've Joined All", callback_data='check_required_join')])
 
         channel_list = '\n'.join(f'• {c}' for c in missing_channels)
 
-        await application.bot.send_message(
+        await self.application.bot.send_message(
             chat_id,
             f'🔐 <b>Channels Required</b>\n\n'
             f'You must join <b>ALL</b> these channels to use this bot:\n\n'
@@ -484,61 +623,54 @@ class BotHandlers:
         return False
 
     # ============================================
-    # COMMAND HANDLERS
+    # FORCE JOIN USER CHANNELS
     # ============================================
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        chat_id = update.effective_chat.id
-        user_id = update.effective_user.id
-        name = update.effective_user.first_name or 'User'
-        args = context.args
-        link = args[0] if args else None
+    async def force_join_user_channels(self, chat_id: int, user_id: int, file: Dict):
+        """Force user to join file owner's channels"""
+        channel_ids = file.get('channel_ids', '').split(',') if file.get('channel_ids') else []
+        channel_names = file.get('channel_names', '').split(',') if file.get('channel_names') else []
 
-        await self.db.create_user(user_id, update.effective_user.username or '', name)
-
-        # Check required channels
-        channel_status = await self.check_all_required_channels(user_id, context.application)
-        all_joined = all(c['joined'] for c in channel_status)
-
-        if not all_joined:
-            await self.force_join_required_channels(chat_id, user_id, context.application)
+        if not channel_ids or not channel_ids[0]:
+            await self.application.bot.send_message(chat_id, '❌ No channels required for this file.')
             return
 
-        await self.db.mark_required_joined(user_id)
+        kb = []
+        channel_list = []
+        user_channels = await self.db.get_user_channels(file['user_id'])
 
-        # Handle file link if provided
-        if link:
-            file = await self.db.get_file_by_link(link)
-            if not file:
-                await update.message.reply_text('❌ Invalid or expired link.')
-                return
+        for i, cid in enumerate(channel_ids):
+            cid = int(cid) if isinstance(cid, str) else cid
+            name = channel_names[i] if i < len(channel_names) else f'Channel {i+1}'
+            channel = next((c for c in user_channels if c['id'] == cid), None)
 
-            if file.get('expiry') and datetime.fromisoformat(file['expiry']) < datetime.now():
-                await self.db.delete_file(file['id'])
-                await update.message.reply_text('❌ This file has expired.')
-                return
+            if channel:
+                link = await self.get_channel_link(name, {
+                    'channel_id': channel['channel_id'],
+                    'link': channel['link']
+                })
+                kb.append([InlineKeyboardButton(f'📢 Join {name}', url=link)])
+                channel_list.append(f'• {name}')
 
-            await self.db.increment_downloads(file['id'])
-
-            try:
-                if file.get('file_id'):
-                    await context.bot.send_document(
-                        chat_id, file['file_id'],
-                        caption=f'📄 {file["name"]}\n📦 {self.format_file_size(file["size"])}'
-                    )
-                elif file.get('from_chat_id') and file.get('original_message_id'):
-                    await context.bot.forward_message(
-                        chat_id, file['from_chat_id'], file['original_message_id']
-                    )
-            except Exception as e:
-                logger.error(f'Failed to send file: {e}')
-                await update.message.reply_text('❌ Failed to send file.')
+        if not kb:
+            await self.application.bot.send_message(chat_id, '❌ No channels found for this file.')
             return
 
-        await self.show_main_menu(update, chat_id, user_id, name)
+        kb.append([InlineKeyboardButton("✅ I've Joined All", callback_data=f'joined_channels_{file["id"]}')])
+
+        await self.application.bot.send_message(
+            chat_id,
+            f'🔐 <b>Channels Required</b>\n\n'
+            f'You must join <b>ALL</b> these channels to download this file:\n\n'
+            f'{chr(10).join(channel_list)}\n\n'
+            f'📄 {file["name"]}\n'
+            f'📦 {self.format_file_size(file["size"])}\n\n'
+            f'Join all channels and click "I\'ve Joined All".',
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
 
     # ============================================
-    # MENU METHODS
+    # SHOW MENUS
     # ============================================
     async def show_main_menu(self, update, chat_id: int, user_id: int, first_name: str):
         """Show main menu"""
@@ -575,6 +707,172 @@ class BotHandlers:
             parse_mode=ParseMode.HTML
         )
 
+    async def show_manage_channels(self, chat_id: int, user_id: int):
+        """Show manage channels menu"""
+        channels = await self.db.get_user_channels(user_id)
+        text = '🔗 Manage Your Channels\n\n'
+
+        if channels:
+            text += f'📋 Your channels ({len(channels)}):\n\n'
+            btns = []
+            for ch in channels:
+                type_icon = '🔒' if ch['channel_type'] == 'private' else '🌐'
+                text += f'  {type_icon} {ch["channel_name"]}\n'
+                text += f'    🆔 ID: {ch["channel_id"]}\n'
+                if ch['link'] and ch['link'] != 'https://t.me/+[INVITE_CODE]':
+                    text += f'    🔗 Link: {ch["link"]}\n'
+                btns.append([InlineKeyboardButton(f'❌ Remove {ch["channel_name"]}', callback_data=f'remove_{ch["id"]}')])
+            text += '\n⚠️ Users must join ALL these channels to download your files.\n\n'
+
+            kb = btns
+        else:
+            text += '📭 No channels added yet.\n\n'
+            text += 'Add channels that users must join to download your files.\n\n'
+            text += '⚠️ You must add at least one channel to upload files.'
+            kb = []
+
+        kb.append([InlineKeyboardButton('➕ Add Public Channel', callback_data='addchannel')])
+        kb.append([InlineKeyboardButton('🔒 Add Private Channel', callback_data='addprivate')])
+        kb.append([InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')])
+
+        await self.application.bot.send_message(
+            chat_id,
+            text,
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    async def show_channel_selection(self, chat_id: int, user_id: int):
+        """Show channel selection for file upload"""
+        session = self.sessions.get(user_id)
+        if not session:
+            return
+
+        if session.get('msg_id'):
+            try:
+                await self.application.bot.delete_message(chat_id, session['msg_id'])
+            except Exception:
+                pass
+            session['msg_id'] = None
+
+        channels = await self.db.get_user_channels(user_id)
+        selected = session.get('selected_channels', [])
+        kb = []
+
+        kb.append([InlineKeyboardButton(f'📢 ALL Channels ({len(channels)})', callback_data='ch_all')])
+
+        for ch in channels:
+            is_selected = ch['id'] in selected
+            kb.append([
+                InlineKeyboardButton(
+                    f"{'✅' if is_selected else '⬜'} {ch['channel_name']}",
+                    callback_data=f'ch_{ch["id"]}'
+                )
+            ])
+
+        kb.append([InlineKeyboardButton('⏭️ Skip (No Channels)', callback_data='ch_skip')])
+        kb.append([InlineKeyboardButton('✅ Done Selecting', callback_data='ch_done')])
+        kb.append([InlineKeyboardButton('❌ Cancel', callback_data='cancel')])
+
+        msg = await self.application.bot.send_message(
+            chat_id,
+            f'✅ File Received!\n\n'
+            f'📄 {session["info"]["name"]}\n'
+            f'📦 {self.format_file_size(session["info"]["size"])}\n\n'
+            f'Select channels users must join (click to toggle):\n'
+            f'• Selected: {len(selected)} channel(s)',
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
+
+        if msg:
+            session['msg_id'] = msg.message_id
+
+    async def show_expiry_options(self, chat_id: int):
+        """Show expiry options"""
+        kb = [
+            [InlineKeyboardButton('5 min', callback_data='exp_5min'),
+             InlineKeyboardButton('10 min', callback_data='exp_10min')],
+            [InlineKeyboardButton('15 min', callback_data='exp_15min'),
+             InlineKeyboardButton('30 min', callback_data='exp_30min')],
+            [InlineKeyboardButton('1 hour', callback_data='exp_1hr'),
+             InlineKeyboardButton('2 hours', callback_data='exp_2hr')],
+            [InlineKeyboardButton('24 hours', callback_data='exp_24hr'),
+             InlineKeyboardButton('♾️ Permanent', callback_data='exp_permanent')],
+            [InlineKeyboardButton('❌ Cancel', callback_data='cancel')]
+        ]
+        await self.application.bot.send_message(
+            chat_id,
+            '⏰ Set expiry time:',
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    # ============================================
+    # COMMAND HANDLERS
+    # ============================================
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        name = update.effective_user.first_name or 'User'
+        args = context.args
+        link = args[0] if args else None
+
+        await self.db.create_user(user_id, update.effective_user.username or '', name)
+
+        # Check required channels
+        channel_status = await self.check_all_required_channels(user_id)
+        all_joined = all(c['joined'] for c in channel_status)
+
+        if not all_joined:
+            await self.force_join_required_channels(chat_id, user_id)
+            return
+
+        await self.db.mark_required_joined(user_id)
+
+        # Handle file link if provided
+        if link:
+            file = await self.db.get_file_by_link(link)
+            if not file:
+                await update.message.reply_text('❌ Invalid or expired link.')
+                return
+
+            if file.get('expiry') and datetime.fromisoformat(file['expiry']) < datetime.now():
+                await self.db.delete_file(file['id'])
+                await update.message.reply_text('❌ This file has expired.')
+                return
+
+            # Check if user needs to join channels
+            if file.get('channel_ids'):
+                channel_ids = [int(cid) for cid in file['channel_ids'].split(',') if cid]
+                all_joined_channels = True
+                for cid in channel_ids:
+                    joined = await self.is_user_member_of_channel(user_id, cid)
+                    if not joined:
+                        all_joined_channels = False
+                        break
+                if not all_joined_channels:
+                    await self.force_join_user_channels(chat_id, user_id, file)
+                    return
+
+            await self.db.increment_downloads(file['id'])
+
+            try:
+                if file.get('file_id'):
+                    await context.bot.send_document(
+                        chat_id, file['file_id'],
+                        caption=f'📄 {file["name"]}\n📦 {self.format_file_size(file["size"])}'
+                    )
+                elif file.get('from_chat_id') and file.get('original_message_id'):
+                    await context.bot.forward_message(
+                        chat_id, file['from_chat_id'], file['original_message_id']
+                    )
+            except Exception as e:
+                logger.error(f'Failed to send file: {e}')
+                await update.message.reply_text('❌ Failed to send file.')
+            return
+
+        await self.show_main_menu(update, chat_id, user_id, name)
+
     # ============================================
     # CALLBACK HANDLER
     # ============================================
@@ -591,7 +889,7 @@ class BotHandlers:
 
         # ---- CHECK REQUIRED JOIN ----
         if data == 'check_required_join':
-            channel_status = await self.check_all_required_channels(user_id, context.application)
+            channel_status = await self.check_all_required_channels(user_id)
             all_joined = all(c['joined'] for c in channel_status)
 
             if all_joined:
@@ -602,13 +900,34 @@ class BotHandlers:
                     pass
                 await context.bot.send_message(chat_id, '✅ Thank you for joining all required channels!')
                 user = await self.db.get_user(user_id)
-                await self.show_main_menu(update, chat_id, user_id, user['first_name'] if user else 'User')
+                # Create a fake update for show_main_menu
+                class FakeUpdate:
+                    def __init__(self, chat_id):
+                        self.message = FakeMessage(chat_id)
+                class FakeMessage:
+                    def __init__(self, chat_id):
+                        self.chat = FakeChat(chat_id)
+                        self.reply_text = lambda *args, **kwargs: None
+                class FakeChat:
+                    def __init__(self, id):
+                        self.id = id
+                fake_update = FakeUpdate(chat_id)
+                await self.show_main_menu(
+                    fake_update, 
+                    chat_id, 
+                    user_id, 
+                    user['first_name'] if user else 'User'
+                )
             else:
                 missing = [c for c in channel_status if not c['joined']]
                 kb = []
 
                 for ch in missing:
-                    kb.append([InlineKeyboardButton(f'📢 Join {ch["channel"]}', url=ch['link'])])
+                    link = await self.get_channel_link(ch['channel'], {
+                        'channel_id': ch['channel_id'],
+                        'link': ch['link']
+                    })
+                    kb.append([InlineKeyboardButton(f'📢 Join {ch["channel"]}', url=link)])
 
                 kb.append([InlineKeyboardButton('🔄 I\'ve Joined All (Retry)', callback_data='check_required_join')])
 
@@ -662,7 +981,7 @@ class BotHandlers:
                 f'   Users must join ALL your channels to download\n'
                 f'⏰ Expiry: Set how long files stay active\n'
                 f'📂 My Files: View & delete your files\n\n'
-                f'🔐 Required Channels: {", ".join(c["name"] for c in REQUIRED_CHANNELS)}\n\n'
+                f'🔐 Required Channels (Bot-wide): {", ".join(c["name"] for c in REQUIRED_CHANNELS)}\n\n'
                 f'🔙 Back to menu',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
@@ -749,8 +1068,8 @@ class BotHandlers:
         if data == 'addchannel':
             self.sessions[user_id] = {'step': 'waiting_public_channel'}
             await query.edit_message_text(
-                f'🌐 Add Channel\n\n'
-                f'Send your channel username or link:\n\n'
+                f'🌐 Add Public Channel\n\n'
+                f'Send your public channel username:\n\n'
                 f'• @my_channel\n'
                 f'• https://t.me/my_channel\n'
                 f'• my_channel\n\n'
@@ -761,31 +1080,29 @@ class BotHandlers:
             )
             return
 
+        # ---- ADD PRIVATE CHANNEL ----
+        if data == 'addprivate':
+            self.sessions[user_id] = {'step': 'waiting_private_channel'}
+            await query.edit_message_text(
+                f'🔒 Add Private Channel\n\n'
+                f'To add a private channel:\n\n'
+                f'1. Make sure @{self.bot_username} is an admin in the channel\n'
+                f'2. Forward ANY message from the channel to this bot\n'
+                f'3. The bot will auto-detect the channel ID and create a permanent invite link\n\n'
+                f'This is the ONLY way to add private channels.\n\n'
+                f'❌ Send /cancel to cancel'
+            )
+            return
+
         # ---- REMOVE CHANNEL ----
         if data.startswith('remove_'):
             channel_id = int(data.replace('remove_', ''))
             await self.db.remove_user_channel(user_id, channel_id)
-            await query.edit_message_text('✅ Channel removed.')
-            user = await self.db.get_user(user_id)
-            # Create a fake update for show_main_menu
-            class FakeUpdate:
-                def __init__(self, chat_id):
-                    self.message = FakeMessage(chat_id)
-            class FakeMessage:
-                def __init__(self, chat_id):
-                    self.chat = FakeChat(chat_id)
-                    self.reply_text = lambda *args, **kwargs: None
-            class FakeChat:
-                def __init__(self, id):
-                    self.id = id
-            
-            fake_update = FakeUpdate(chat_id)
-            await self.show_main_menu(
-                fake_update, 
-                chat_id, 
-                user_id, 
-                user['first_name'] if user else 'User'
-            )
+            try:
+                await context.bot.delete_message(chat_id, query.message.message_id)
+            except Exception:
+                pass
+            await self.show_manage_channels(chat_id, user_id)
             return
 
         # ---- UPLOAD ----
@@ -909,6 +1226,206 @@ class BotHandlers:
             )
             return
 
+        # ---- CHANNEL SELECTION ----
+        if data == 'ch_all':
+            session = self.sessions.get(user_id)
+            if not session:
+                return
+            channels = await self.db.get_user_channels(user_id)
+            session['selected_channels'] = [c['id'] for c in channels]
+            await self.show_channel_selection(chat_id, user_id)
+            return
+
+        if data.startswith('ch_') and data not in ['ch_done', 'ch_skip', 'ch_all']:
+            channel_id = int(data.replace('ch_', ''))
+            session = self.sessions.get(user_id)
+            if not session:
+                return
+
+            if channel_id in session['selected_channels']:
+                session['selected_channels'].remove(channel_id)
+            else:
+                session['selected_channels'].append(channel_id)
+
+            await self.show_channel_selection(chat_id, user_id)
+            return
+
+        # ---- CH_DONE ----
+        if data == 'ch_done':
+            session = self.sessions.get(user_id)
+            if not session:
+                return
+
+            logger.info(f'✅ Done selecting. Selected: {len(session["selected_channels"])} channels')
+
+            if session.get('msg_id'):
+                try:
+                    await context.bot.delete_message(chat_id, session['msg_id'])
+                except Exception:
+                    pass
+                session['msg_id'] = None
+
+            session['step'] = 'waiting_expiry'
+            await self.show_expiry_options(chat_id)
+            return
+
+        # ---- CH_SKIP ----
+        if data == 'ch_skip':
+            session = self.sessions.get(user_id)
+            if not session:
+                return
+
+            logger.info('⏭️ Skipping channel selection')
+
+            session['selected_channels'] = []
+
+            if session.get('msg_id'):
+                try:
+                    await context.bot.delete_message(chat_id, session['msg_id'])
+                except Exception:
+                    pass
+                session['msg_id'] = None
+
+            session['step'] = 'waiting_expiry'
+            await self.show_expiry_options(chat_id)
+            return
+
+        # ---- EXPIRY ----
+        if data.startswith('exp_'):
+            opt = data.replace('exp_', '')
+            expiry_seconds = self.get_expiry(opt)
+            expiry = (datetime.now() + timedelta(seconds=expiry_seconds)).isoformat() if expiry_seconds else None
+            session = self.sessions.get(user_id)
+            if not session or not session.get('file_id'):
+                return
+
+            file_data = {
+                'id': session['file_id'],
+                'user_id': user_id,
+                'name': session['info']['name'],
+                'size': session['info']['size'],
+                'mime_type': session['info']['mime_type'],
+                'file_id': session['info']['file_id'],
+                'from_chat_id': session['info']['from_chat_id'],
+                'original_message_id': session['info']['original_message_id'],
+                'is_forwarded': session['info']['is_forwarded'],
+                'expiry': expiry
+            }
+
+            result = await self.db.create_file(file_data)
+
+            # Add file-channel associations
+            for cid in session['selected_channels']:
+                await self.db.add_file_channel(result['id'], cid)
+
+            file_link = result['link_code']
+
+            self.sessions.pop(user_id, None)
+
+            link = f'https://t.me/{self.bot_username}?start={file_link}'
+
+            try:
+                await context.bot.delete_message(chat_id, query.message.message_id)
+            except Exception:
+                pass
+
+            await context.bot.send_message(
+                chat_id,
+                f'✅ <b>File Uploaded!</b>\n\n'
+                f'📄 {file_data["name"]}\n'
+                f'📦 {self.format_file_size(file_data["size"])}\n'
+                f'⏰ {self.format_expiry(expiry_seconds) if expiry_seconds else "♾️ Permanent"}\n'
+                f'📢 Channels: {len(session["selected_channels"])} channel(s)\n\n'
+                f'🔗 Shareable Link:\n'
+                f'{link}\n\n'
+                f'⚠️ Users must join ALL required channels to download.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('📤 Upload More', callback_data='upload')],
+                    [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
+                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                ]),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # ---- JOINED CHANNELS ----
+        if data.startswith('joined_channels_'):
+            file_id = data.replace('joined_channels_', '')
+
+            file = await self.db.get_file_by_id(file_id)
+            if not file:
+                await query.edit_message_text(
+                    '❌ File not found. It may have been deleted or expired.',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    ])
+                )
+                return
+
+            if file.get('expiry') and datetime.fromisoformat(file['expiry']) < datetime.now():
+                await self.db.delete_file(file['id'])
+                await query.edit_message_text(
+                    '❌ This file has expired.',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                    ])
+                )
+                return
+
+            channel_ids = [int(cid) for cid in file.get('channel_ids', '').split(',') if cid] if file.get('channel_ids') else []
+
+            all_joined = True
+            for cid in channel_ids:
+                joined = await self.is_user_member_of_channel(user_id, cid)
+                if not joined:
+                    all_joined = False
+                    break
+
+            if not all_joined:
+                kb = []
+                user_channels = await self.db.get_user_channels(file['user_id'])
+
+                for cid in channel_ids:
+                    channel = next((c for c in user_channels if c['id'] == cid), None)
+                    if channel:
+                        link = await self.get_channel_link(channel['channel_name'], {
+                            'channel_id': channel['channel_id'],
+                            'link': channel['link']
+                        })
+                        kb.append([InlineKeyboardButton(f'📢 Join {channel["channel_name"]}', url=link)])
+                kb.append([InlineKeyboardButton('✅ I\'ve Joined All', callback_data=f'joined_channels_{file_id}')])
+
+                await query.edit_message_text(
+                    f'❌ You haven\'t joined all channels yet.\n\n'
+                    f'Please join all channels and click "I\'ve Joined All".',
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            await self.db.increment_downloads(file['id'])
+            try:
+                await context.bot.delete_message(chat_id, query.message.message_id)
+            except Exception:
+                pass
+
+            try:
+                if file.get('file_id'):
+                    await context.bot.send_document(
+                        chat_id, file['file_id'],
+                        caption=f'📄 {file["name"]}\n📦 {self.format_file_size(file["size"])}\n📥 {file["downloads"] + 1} downloads'
+                    )
+                elif file.get('from_chat_id') and file.get('original_message_id'):
+                    await context.bot.forward_message(
+                        chat_id, file['from_chat_id'], file['original_message_id']
+                    )
+                else:
+                    await context.bot.send_message(chat_id, '❌ Failed to send file. The file data is incomplete.')
+            except Exception as e:
+                logger.error(f'❌ Send file error: {e}')
+                await context.bot.send_message(chat_id, '❌ Failed to send file. Please try again.')
+            return
+
         # ---- CANCEL ----
         if data == 'cancel':
             self.sessions.pop(user_id, None)
@@ -938,41 +1455,6 @@ class BotHandlers:
                 user['first_name'] if user else 'User'
             )
             return
-
-    # ============================================
-    # MANAGE CHANNELS
-    # ============================================
-    async def show_manage_channels(self, chat_id: int, user_id: int):
-        """Show manage channels menu"""
-        channels = await self.db.get_user_channels(user_id)
-        text = '🔗 Manage Your Channels\n\n'
-
-        if channels:
-            text += f'📋 Your channels ({len(channels)}):\n\n'
-            btns = []
-            for ch in channels:
-                type_icon = '🔒' if ch['channel_type'] == 'private' else '🌐'
-                text += f'  {type_icon} {ch["channel_name"]}\n'
-                text += f'    🆔 ID: {ch["channel_id"]}\n'
-                if ch['link'] and ch['link'] != 'https://t.me/+[INVITE_CODE]':
-                    text += f'    🔗 Link: {ch["link"]}\n'
-                btns.append([InlineKeyboardButton(f'❌ Remove {ch["channel_name"]}', callback_data=f'remove_{ch["id"]}')])
-            text += '\n⚠️ Users must join ALL these channels to download your files.\n\n'
-
-            kb = btns        else:
-            text += '📭 No channels added yet.\n\n'
-            text += 'Add channels that users must join to download your files.\n\n'
-            text += '⚠️ You must add at least one channel to upload files.'
-            kb = []
-
-        kb.append([InlineKeyboardButton('➕ Add Channel', callback_data='addchannel')])
-        kb.append([InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')])
-
-        await self.application.bot.send_message(
-            chat_id,
-            text,
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
 
     # ============================================
     # TEXT HANDLER
@@ -1011,6 +1493,14 @@ class BotHandlers:
             )
             return
 
+        # Handle private channel detection via forwarded message
+        if msg.forward_from_chat:
+            session = self.sessions.get(user_id)
+            if session and session.get('step') == 'waiting_private_channel':
+                await self.handle_private_channel_detection(update, context)
+                return
+            return
+
         # Handle public channel add
         session = self.sessions.get(user_id)
         if session and session.get('step') == 'waiting_public_channel':
@@ -1018,27 +1508,86 @@ class BotHandlers:
             await self.handle_public_channel_add(user_id, chat_id, channel_input, context)
 
     # ============================================
+    # PRIVATE CHANNEL DETECTION
+    # ============================================
+    async def handle_private_channel_detection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle private channel detection from forwarded message"""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        msg = update.message
+
+        if not msg.forward_from_chat:
+            return
+
+        session = self.sessions.get(user_id)
+        if not session or session.get('step') != 'waiting_private_channel':
+            return
+
+        detection = await self.detect_private_channel_from_forward(msg)
+
+        if not detection['success']:
+            await context.bot.send_message(
+                chat_id,
+                f'❌ {detection["error"]}',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('🔄 Try Again', callback_data='addprivate')],
+                    [InlineKeyboardButton('❌ Cancel', callback_data='cancel')]
+                ])
+            )
+            return
+
+        existing = await self.db.get_user_channels(user_id)
+        exists = any(c['channel_id'] == detection['channel_id'] for c in existing)
+
+        if exists:
+            await context.bot.send_message(
+                chat_id,
+                f'⚠️ This channel is already in your list.\n\n'
+                f'📢 {detection["title"]}\n'
+                f'🆔 {detection["channel_id"]}',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                ])
+            )
+            self.sessions.pop(user_id, None)
+            return
+
+        await self.db.add_user_channel(user_id, {
+            'name': detection['title'],
+            'channel_id': detection['channel_id'],
+            'type': 'private',
+            'link': detection['link']
+        })
+
+        channels = await self.db.get_user_channels(user_id)
+
+        await context.bot.send_message(
+            chat_id,
+            f'✅ <b>Private Channel Added!</b>\n\n'
+            f'📢 {detection["title"]}\n'
+            f'🆔 {detection["channel_id"]}\n'
+            f'🔗 {detection["link"]}\n\n'
+            f'You now have {len(channels)} channel(s).',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
+                [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
+                [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+            ]),
+            parse_mode=ParseMode.HTML
+        )
+
+        self.sessions.pop(user_id, None)
+
+    # ============================================
     # PUBLIC CHANNEL ADD
     # ============================================
     async def handle_public_channel_add(self, user_id: int, chat_id: int, channel_input: str, context):
         """Handle public channel addition"""
-        # Extract channel name
-        if channel_input.startswith('@'):
-            channel_name = channel_input[1:]
-        elif 't.me/' in channel_input:
-            channel_name = channel_input.split('t.me/')[-1]
-        else:
-            channel_name = channel_input
-
-        # Check if channel exists (simplified)
-        try:
-            chat = await context.bot.get_chat(f'@{channel_name}')
-            channel_id = chat.id
-            channel_title = chat.title or channel_name
-        except Exception as e:
+        detection = await self.detect_public_channel(channel_input)
+        if not detection['success']:
             await context.bot.send_message(
                 chat_id,
-                f'❌ Could not find channel @{channel_name}. Please make sure it exists and the bot is an admin.',
+                f'❌ {detection["error"]}',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔄 Try Again', callback_data='addchannel')],
                     [InlineKeyboardButton('❌ Cancel', callback_data='cancel')]
@@ -1046,20 +1595,20 @@ class BotHandlers:
             )
             return
 
-        # Check if channel already exists
         existing = await self.db.get_user_channels(user_id)
-        if any(c['channel_id'] == channel_id for c in existing):
+        exists = any(c['channel_id'] == detection['channel_id'] for c in existing)
+
+        if exists:
             await context.bot.send_message(chat_id, '⚠️ This channel is already in your list.')
             self.sessions.pop(user_id, None)
             await self.show_manage_channels(chat_id, user_id)
             return
 
-        # Add channel
         await self.db.add_user_channel(user_id, {
-            'name': f'@{channel_name}',
-            'channel_id': channel_id,
+            'name': detection['title'],
+            'channel_id': detection['channel_id'],
             'type': 'public',
-            'link': f'https://t.me/{channel_name}'
+            'link': detection['link']
         })
 
         self.sessions.pop(user_id, None)
@@ -1068,8 +1617,8 @@ class BotHandlers:
         await context.bot.send_message(
             chat_id,
             f'✅ <b>Channel Added!</b>\n\n'
-            f'📢 {channel_title}\n'
-            f'🆔 {channel_id}\n\n'
+            f'📢 {detection["title"]}\n'
+            f'🆔 {detection["channel_id"]}\n\n'
             f'You now have {len(channels)} channel(s).',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
@@ -1146,55 +1695,70 @@ class BotHandlers:
 
         # Create file in database
         unique_id = secrets.token_hex(16)
-        file_data = {
-            'id': unique_id,
-            'user_id': user_id,
-            'name': file_name,
-            'size': file_size,
-            'mime_type': mime_type,
-            'file_id': file_id,
-            'from_chat_id': from_chat_id,
-            'original_message_id': original_message_id,
-            'is_forwarded': is_forwarded,
-            'expiry': None  # Permanent by default
-        }
-
-        result = await self.db.create_file(file_data)
-
-        # Get user channels for this file
+        
+        # Check if user has channels, if not, use a default
         user_channels = await self.db.get_user_channels(user_id)
         
-        # Add file-channel associations
-        for ch in user_channels:
-            cursor = self.db.conn.cursor()
-            cursor.execute(
-                'INSERT INTO file_channels (file_id, channel_id) VALUES (?, ?)',
-                (result['id'], ch['id'])
+        # Store in session for channel selection
+        self.sessions[user_id] = {
+            'step': 'waiting_channels',
+            'file_id': unique_id,
+            'info': {
+                'name': file_name,
+                'size': file_size,
+                'mime_type': mime_type,
+                'file_id': file_id,
+                'from_chat_id': from_chat_id,
+                'original_message_id': original_message_id,
+                'is_forwarded': is_forwarded
+            },
+            'selected_channels': [ch['id'] for ch in user_channels]  # Auto-select all channels
+        }
+
+        # If user has channels, go to expiry directly
+        if user_channels:
+            # Create file directly with all channels
+            file_data = {
+                'id': unique_id,
+                'user_id': user_id,
+                'name': file_name,
+                'size': file_size,
+                'mime_type': mime_type,
+                'file_id': file_id,
+                'from_chat_id': from_chat_id,
+                'original_message_id': original_message_id,
+                'is_forwarded': is_forwarded,
+                'expiry': None
+            }
+
+            result = await self.db.create_file(file_data)
+
+            # Add file-channel associations
+            for ch in user_channels:
+                await self.db.add_file_channel(result['id'], ch['id'])
+
+            self.sessions.pop(user_id, None)
+
+            link = f'https://t.me/{self.bot_username}?start={result["link_code"]}'
+
+            await msg.reply_text(
+                f'✅ <b>File Uploaded!</b>\n\n'
+                f'📄 {file_name}\n'
+                f'📦 {self.format_file_size(file_size)}\n'
+                f'⏰ ♾️ Permanent\n'
+                f'📢 Channels: {len(user_channels)} channel(s)\n\n'
+                f'🔗 Shareable Link:\n'
+                f'{link}',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('📤 Upload More', callback_data='upload')],
+                    [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
+                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                ]),
+                parse_mode=ParseMode.HTML
             )
-        self.db.conn.commit()
-
-        self.sessions.pop(user_id, None)
-
-        link = f'https://t.me/{self.bot_username}?start={result["link_code"]}'
-
-        channel_list = '\n'.join(f'• {c["channel_name"]}' for c in user_channels) if user_channels else 'None'
-
-        await msg.reply_text(
-            f'✅ <b>File Uploaded!</b>\n\n'
-            f'📄 {file_name}\n'
-            f'📦 {self.format_file_size(file_size)}\n'
-            f'⏰ ♾️ Permanent\n'
-            f'📢 Channels: {len(user_channels)} channel(s)\n\n'
-            f'🔗 Shareable Link:\n'
-            f'{link}\n\n'
-            f'📋 Required Channels:\n{channel_list}',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('📤 Upload More', callback_data='upload')],
-                [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
-                [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
-            ]),
-            parse_mode=ParseMode.HTML
-        )
+        else:
+            # No channels, show channel selection
+            await self.show_channel_selection(chat_id, user_id)
 
 
 # ============================================
@@ -1243,9 +1807,7 @@ async def main():
     logger.info('\n✅ Bot is ready!')
     logger.info(f'\n👑 Admins: {", ".join(str(a) for a in ADMIN_IDS) if ADMIN_IDS else "None"}')
 
-    # ============================================
-    # FIX: Use run_polling() instead of manual start
-    # ============================================
+    # Start the bot using run_polling()
     await application.run_polling()
 
 
