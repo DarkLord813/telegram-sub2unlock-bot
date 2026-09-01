@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================
 # TELEGRAM FILE SHARING BOT - COMPLETE WORKING VERSION
-# Fixed: Proper async handling for python-telegram-bot 13.7
+# Fixed: Proper session handling for file uploads
 # ============================================
 
 import os
@@ -342,15 +342,14 @@ class Database:
 
 
 # ============================================
-# BOT HANDLERS CLASS - Synchronous for python-telegram-bot 13.7
+# BOT HANDLERS CLASS
 # ============================================
 class BotHandlers:
     def __init__(self, db: Database):
         self.db = db
         self.bot_username = ''
         self.bot_id = 0
-        self.sessions = {}
-        self.updater = None
+        self.sessions = {}  # user_id -> session data
 
     def format_file_size(self, bytes: int) -> str:
         if bytes < 1024:
@@ -382,6 +381,7 @@ class BotHandlers:
         return user_id in ADMIN_IDS
 
     def get_session(self, user_id: int) -> Optional[Dict]:
+        """Get session for user, remove if expired (> 1 hour)"""
         session = self.sessions.get(user_id)
         if session and session.get('created_at'):
             if (datetime.now() - session['created_at']).seconds > 3600:
@@ -390,11 +390,16 @@ class BotHandlers:
         return session
 
     def set_session(self, user_id: int, data: Dict):
+        """Set session for user with timestamp"""
         data['created_at'] = datetime.now()
         self.sessions[user_id] = data
+        logger.info(f'📝 Session set for user {user_id}: {data.get("step")}')
 
     def clear_session(self, user_id: int):
-        self.sessions.pop(user_id, None)
+        """Clear session for user"""
+        if user_id in self.sessions:
+            logger.info(f'🗑️ Session cleared for user {user_id}')
+            self.sessions.pop(user_id, None)
 
     # ============================================
     # CHANNEL HELPERS
@@ -702,6 +707,7 @@ class BotHandlers:
     def show_channel_selection(self, bot, chat_id: int, user_id: int):
         session = self.get_session(user_id)
         if not session:
+            logger.warning(f'No session found for user {user_id} in show_channel_selection')
             return
 
         if session.get('msg_id'):
@@ -1048,6 +1054,7 @@ class BotHandlers:
                 )
                 return
 
+            # Set session for file upload
             self.set_session(user_id, {'step': 'waiting_file'})
             try:
                 context.bot.delete_message(chat_id, query.message.message_id)
@@ -1159,6 +1166,7 @@ class BotHandlers:
         if data == 'ch_all':
             session = self.get_session(user_id)
             if not session:
+                logger.warning(f'No session found for user {user_id} in ch_all')
                 return
             channels = self.db.get_user_channels(user_id)
             session['selected_channels'] = [c['id'] for c in channels]
@@ -1169,6 +1177,7 @@ class BotHandlers:
             channel_id = int(data.replace('ch_', ''))
             session = self.get_session(user_id)
             if not session:
+                logger.warning(f'No session found for user {user_id} in ch_ selection')
                 return
 
             if channel_id in session['selected_channels']:
@@ -1183,6 +1192,7 @@ class BotHandlers:
         if data == 'ch_done':
             session = self.get_session(user_id)
             if not session:
+                logger.warning(f'No session found for user {user_id} in ch_done')
                 return
 
             logger.info(f'✅ Done selecting. Selected: {len(session["selected_channels"])} channels')
@@ -1202,6 +1212,7 @@ class BotHandlers:
         if data == 'ch_skip':
             session = self.get_session(user_id)
             if not session:
+                logger.warning(f'No session found for user {user_id} in ch_skip')
                 return
 
             logger.info('⏭️ Skipping channel selection')
@@ -1226,6 +1237,7 @@ class BotHandlers:
             expiry = (datetime.now() + timedelta(seconds=expiry_seconds)).isoformat() if expiry_seconds else None
             session = self.get_session(user_id)
             if not session or not session.get('file_id'):
+                logger.warning(f'No session or file_id for user {user_id} in expiry')
                 return
 
             file_data = {
@@ -1237,7 +1249,7 @@ class BotHandlers:
                 'file_id': session['info']['file_id'],
                 'from_chat_id': session['info']['from_chat_id'],
                 'original_message_id': session['info']['original_message_id'],
-                'is_forwarded': session['info']['is_forwarded'],
+                'is_forwarded': 1 if session['info']['is_forwarded'] else 0,
                 'expiry': expiry
             }
 
@@ -1380,6 +1392,8 @@ class BotHandlers:
 
         if not msg.text:
             return
+
+        logger.info(f'📨 Text from user {user_id}: {msg.text[:50]}')
 
         if msg.text == '/cancel':
             self.clear_session(user_id)
@@ -1533,8 +1547,30 @@ class BotHandlers:
         chat_id = update.effective_chat.id
         msg = update.message
 
+        logger.info(f'📨 File received from user {user_id}, type: {file_type}')
+
+        # Check if user has an active session
         session = self.get_session(user_id)
-        if not session or session.get('step') != 'waiting_file':
+        if not session:
+            logger.warning(f'No session found for user {user_id} in file_handler')
+            msg.reply_text(
+                '⚠️ Please use the "Upload File" button first.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
+                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                ])
+            )
+            return
+
+        if session.get('step') != 'waiting_file':
+            logger.warning(f'User {user_id} is in step {session.get("step")}, not waiting_file')
+            msg.reply_text(
+                '⚠️ Please use the "Upload File" button first.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('📤 Upload File', callback_data='upload')],
+                    [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+                ])
+            )
             return
 
         # Get file info
@@ -1577,6 +1613,7 @@ class BotHandlers:
             file_size = file.file_size
             file_id = file.file_id
         else:
+            msg.reply_text('❌ Please send a document, photo, or video.')
             return
 
         # Check size limit for direct sends
@@ -1601,50 +1638,25 @@ class BotHandlers:
             self.clear_session(user_id)
             return
 
-        # Create file in database
+        # Store file info in session and show channel selection
         unique_id = secrets.token_hex(16)
         
-        file_data = {
-            'id': unique_id,
-            'user_id': user_id,
+        # Update session with file info
+        session['file_id'] = unique_id
+        session['info'] = {
             'name': file_name,
             'size': file_size,
             'mime_type': mime_type,
             'file_id': file_id,
             'from_chat_id': from_chat_id,
             'original_message_id': original_message_id,
-            'is_forwarded': 1 if is_forwarded else 0,
-            'expiry': None
+            'is_forwarded': is_forwarded
         }
-
-        result = self.db.create_file(file_data)
-
-        # Add file-channel associations
-        for ch in user_channels:
-            self.db.add_file_channel(result['id'], ch['id'])
-
-        self.clear_session(user_id)
-
-        link = f'https://t.me/{self.bot_username}?start={result["link_code"]}'
-
-        channel_list = '\n'.join(f'• {c["channel_name"]}' for c in user_channels)
-
-        msg.reply_text(
-            f'✅ <b>File Uploaded!</b>\n\n'
-            f'📄 {file_name}\n'
-            f'📦 {self.format_file_size(file_size)}\n'
-            f'⏰ ♾️ Permanent\n'
-            f'📢 Channels: {len(user_channels)} channel(s)\n\n'
-            f'🔗 Shareable Link:\n'
-            f'{link}\n\n'
-            f'📋 Required Channels:\n{channel_list}',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('📤 Upload More', callback_data='upload')],
-                [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
-                [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
-            ]),
-            parse_mode=ParseMode.HTML
-        )
+        session['selected_channels'] = [ch['id'] for ch in user_channels]
+        session['step'] = 'waiting_channels'
+        
+        # Show channel selection
+        self.show_channel_selection(context.bot, chat_id, user_id)
 
 
 # ============================================
@@ -1681,9 +1693,6 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # Store handlers reference
-    handlers.updater = updater
-
     # Store bot info
     bot_info = updater.bot.get_me()
     handlers.bot_username = bot_info.username
@@ -1703,7 +1712,7 @@ def main():
         ('start', '🚀 Start the bot'),
     ])
 
-    # Add handlers - using lambda to pass file_type
+    # Add handlers
     dp.add_handler(CommandHandler('start', handlers.start_command))
     dp.add_handler(MessageHandler(Filters.document, lambda u, c: handlers.file_handler(u, c, 'document')))
     dp.add_handler(MessageHandler(Filters.photo, lambda u, c: handlers.file_handler(u, c, 'photo')))
