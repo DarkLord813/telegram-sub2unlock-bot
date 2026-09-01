@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================
 # TELEGRAM FILE SHARING BOT - COMPLETE WORKING VERSION
-# Full rewrite from Node.js with all features intact
+# Fixed: Proper async handling for python-telegram-bot 13.7
 # ============================================
 
 import os
@@ -11,7 +11,7 @@ import secrets
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -34,7 +34,7 @@ load_dotenv()
 # ============================================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
-DB_PATH = os.getenv('DB_PATH', './bot_database.db')
+DB_PATH = os.getenv('DB_PATH', './data/bot_database.db')
 MAX_FILE_SIZE_SEND = 50 * 1024 * 1024  # 50MB for direct send
 PORT = int(os.getenv('PORT', 10000))
 
@@ -94,7 +94,6 @@ class Database:
         self.init_db()
 
     def init_db(self):
-        # Ensure directory exists
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
@@ -104,7 +103,6 @@ class Database:
         self.conn.execute('PRAGMA journal_mode=WAL')
         cursor = self.conn.cursor()
 
-        # Users table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -115,7 +113,6 @@ class Database:
             )
         ''')
 
-        # Required channels table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS required_channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +125,6 @@ class Database:
             )
         ''')
 
-        # User channels table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,7 +138,6 @@ class Database:
             )
         ''')
 
-        # Files table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS files (
                 id TEXT PRIMARY KEY,
@@ -162,7 +157,6 @@ class Database:
             )
         ''')
 
-        # File channels junction table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS file_channels (
                 file_id TEXT,
@@ -199,22 +193,6 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM required_channels WHERE verified = 1')
         return [dict(row) for row in cursor.fetchall()]
-
-    def update_required_channel_id(self, channel_name: str, channel_id: int):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            'UPDATE required_channels SET channel_id = ? WHERE channel_name = ?',
-            (channel_id, channel_name)
-        )
-        self.conn.commit()
-
-    def update_channel_link(self, channel_name: str, link: str):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            'UPDATE required_channels SET link = ? WHERE channel_name = ?',
-            (link, channel_name)
-        )
-        self.conn.commit()
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         cursor = self.conn.cursor()
@@ -364,7 +342,7 @@ class Database:
 
 
 # ============================================
-# BOT HANDLERS CLASS
+# BOT HANDLERS CLASS - Synchronous for python-telegram-bot 13.7
 # ============================================
 class BotHandlers:
     def __init__(self, db: Database):
@@ -372,10 +350,8 @@ class BotHandlers:
         self.bot_username = ''
         self.bot_id = 0
         self.sessions = {}
+        self.updater = None
 
-    # ============================================
-    # HELPER METHODS
-    # ============================================
     def format_file_size(self, bytes: int) -> str:
         if bytes < 1024:
             return f'{bytes} B'
@@ -421,26 +397,26 @@ class BotHandlers:
         self.sessions.pop(user_id, None)
 
     # ============================================
-    # CHANNEL DETECTION
+    # CHANNEL HELPERS
     # ============================================
-    async def create_invite_link(self, bot, channel_id: int) -> Optional[str]:
+    def create_invite_link(self, bot, channel_id: int) -> Optional[str]:
         try:
-            invite_link = await bot.create_chat_invite_link(channel_id, member_limit=0)
+            invite_link = bot.create_chat_invite_link(channel_id, member_limit=0)
             return invite_link.invite_link
         except Exception as e:
             logger.warning(f'⚠️ Could not create invite link: {e}')
             return None
 
-    async def get_channel_link(self, bot, channel_name: str, channel_info: Dict) -> str:
+    def get_channel_link(self, bot, channel_name: str, channel_info: Dict) -> str:
         if (channel_info and channel_info.get('link') and
             channel_info['link'] != 'https://t.me/+[INVITE_CODE]' and
             '[INVITE_CODE]' not in channel_info['link']):
             return channel_info['link']
 
         if channel_name.startswith('+') and channel_info and channel_info.get('channel_id'):
-            invite_link = await self.create_invite_link(bot, channel_info['channel_id'])
+            invite_link = self.create_invite_link(bot, channel_info['channel_id'])
             if invite_link:
-                await self.db.update_channel_link(channel_name, invite_link)
+                self.db.update_channel_link(channel_name, invite_link)
                 return invite_link
             return f'https://t.me/{channel_name}'
 
@@ -449,16 +425,16 @@ class BotHandlers:
 
         return f'https://t.me/{channel_name}'
 
-    async def is_bot_admin_in_channel(self, bot, channel_id: int) -> bool:
+    def is_bot_admin_in_channel(self, bot, channel_id: int) -> bool:
         try:
-            member = await bot.get_chat_member(channel_id, self.bot_id)
+            member = bot.get_chat_member(channel_id, self.bot_id)
             return member.status in ['administrator', 'creator']
         except Exception:
             return False
 
-    async def is_user_member_of_channel(self, bot, user_id: int, channel_id: int) -> bool:
+    def is_user_member_of_channel(self, bot, user_id: int, channel_id: int) -> bool:
         try:
-            member = await bot.get_chat_member(channel_id, user_id)
+            member = bot.get_chat_member(channel_id, user_id)
             return member.status in ['member', 'administrator', 'creator']
         except Exception:
             return False
@@ -466,7 +442,7 @@ class BotHandlers:
     # ============================================
     # DETECT CHANNELS
     # ============================================
-    async def detect_private_channel_from_forward(self, bot, msg) -> Dict:
+    def detect_private_channel_from_forward(self, bot, msg) -> Dict:
         if not msg.forward_from_chat:
             return {'success': False, 'error': '❌ Not a forwarded message'}
 
@@ -475,7 +451,7 @@ class BotHandlers:
         channel_title = chat.title or 'Private Channel'
         channel_username = chat.username
 
-        is_admin = await self.is_bot_admin_in_channel(bot, channel_id)
+        is_admin = self.is_bot_admin_in_channel(bot, channel_id)
 
         if not is_admin:
             return {
@@ -483,7 +459,7 @@ class BotHandlers:
                 'error': f'❌ Bot is not an admin in "{channel_title}".\n\nPlease add @{self.bot_username} as an admin.'
             }
 
-        link = await self.create_invite_link(bot, channel_id)
+        link = self.create_invite_link(bot, channel_id)
 
         if not link:
             if channel_username:
@@ -500,27 +476,27 @@ class BotHandlers:
             'link': link
         }
 
-    async def detect_public_channel(self, bot, identifier: str) -> Dict:
+    def detect_public_channel(self, bot, identifier: str) -> Dict:
         try:
             chat_info = None
             clean_id = identifier.replace('@', '').strip()
 
             try:
-                chat_info = await bot.get_chat(f'@{clean_id}')
+                chat_info = bot.get_chat(f'@{clean_id}')
             except Exception:
                 try:
-                    chat_info = await bot.get_chat(clean_id)
+                    chat_info = bot.get_chat(clean_id)
                 except Exception:
                     match = re.search(r't\.me/(.+)', identifier)
                     if match:
                         username = match.group(1)
-                        chat_info = await bot.get_chat(f'@{username}')
+                        chat_info = bot.get_chat(f'@{username}')
                         clean_id = username
 
             if not chat_info or not chat_info.id:
                 return {'success': False, 'error': '❌ Channel not found.'}
 
-            is_admin = await self.is_bot_admin_in_channel(bot, chat_info.id)
+            is_admin = self.is_bot_admin_in_channel(bot, chat_info.id)
             if not is_admin:
                 return {
                     'success': False,
@@ -540,7 +516,7 @@ class BotHandlers:
     # ============================================
     # CHECK REQUIRED CHANNELS
     # ============================================
-    async def check_all_required_channels(self, bot, user_id: int) -> List[Dict]:
+    def check_all_required_channels(self, bot, user_id: int) -> List[Dict]:
         results = []
 
         for channel in REQUIRED_CHANNELS:
@@ -549,17 +525,17 @@ class BotHandlers:
 
             if channel['type'] == 'public' and not channel_id:
                 try:
-                    detection = await self.detect_public_channel(bot, channel['identifier'])
+                    detection = self.detect_public_channel(bot, channel['identifier'])
                     if detection['success']:
                         channel_id = detection['channel_id']
                         channel['channel_id'] = channel_id
-                        await self.db.update_required_channel_id(channel['name'], channel_id)
+                        self.db.update_required_channel_id(channel['name'], channel_id)
                         logger.info(f'✅ Detected channel ID for {channel["name"]}: {channel_id}')
                 except Exception as e:
                     logger.warning(f'⚠️ Could not detect {channel["name"]}: {e}')
 
             if channel_id:
-                joined = await self.is_user_member_of_channel(bot, user_id, channel_id)
+                joined = self.is_user_member_of_channel(bot, user_id, channel_id)
 
             results.append({
                 'channel': channel['name'],
@@ -571,12 +547,12 @@ class BotHandlers:
 
         return results
 
-    async def force_join_required_channels(self, bot, chat_id: int, user_id: int) -> bool:
-        channel_status = await self.check_all_required_channels(bot, user_id)
+    def force_join_required_channels(self, bot, chat_id: int, user_id: int) -> bool:
+        channel_status = self.check_all_required_channels(bot, user_id)
         all_joined = all(c['joined'] for c in channel_status)
 
         if all_joined:
-            await self.db.mark_required_joined(user_id)
+            self.db.mark_required_joined(user_id)
             return True
 
         kb = []
@@ -584,7 +560,7 @@ class BotHandlers:
 
         for ch in channel_status:
             if not ch['joined']:
-                link = await self.get_channel_link(bot, ch['channel'], {
+                link = self.get_channel_link(bot, ch['channel'], {
                     'channel_id': ch['channel_id'],
                     'link': ch['link']
                 })
@@ -595,7 +571,7 @@ class BotHandlers:
 
         channel_list = '\n'.join(f'• {c}' for c in missing_channels)
 
-        await bot.send_message(
+        bot.send_message(
             chat_id,
             f'🔐 <b>Channels Required</b>\n\n'
             f'You must join <b>ALL</b> these channels to use this bot:\n\n'
@@ -609,17 +585,17 @@ class BotHandlers:
     # ============================================
     # FORCE JOIN USER CHANNELS
     # ============================================
-    async def force_join_user_channels(self, bot, chat_id: int, user_id: int, file: Dict):
+    def force_join_user_channels(self, bot, chat_id: int, user_id: int, file: Dict):
         channel_ids = file.get('channel_ids', '').split(',') if file.get('channel_ids') else []
         channel_names = file.get('channel_names', '').split(',') if file.get('channel_names') else []
 
         if not channel_ids or not channel_ids[0]:
-            await bot.send_message(chat_id, '❌ No channels required for this file.')
+            bot.send_message(chat_id, '❌ No channels required for this file.')
             return
 
         kb = []
         channel_list = []
-        user_channels = await self.db.get_user_channels(file['user_id'])
+        user_channels = self.db.get_user_channels(file['user_id'])
 
         for i, cid in enumerate(channel_ids):
             cid = int(cid) if isinstance(cid, str) else cid
@@ -627,7 +603,7 @@ class BotHandlers:
             channel = next((c for c in user_channels if c['id'] == cid), None)
 
             if channel:
-                link = await self.get_channel_link(bot, name, {
+                link = self.get_channel_link(bot, name, {
                     'channel_id': channel['channel_id'],
                     'link': channel['link']
                 })
@@ -635,12 +611,12 @@ class BotHandlers:
                 channel_list.append(f'• {name}')
 
         if not kb:
-            await bot.send_message(chat_id, '❌ No channels found for this file.')
+            bot.send_message(chat_id, '❌ No channels found for this file.')
             return
 
         kb.append([InlineKeyboardButton("✅ I've Joined All", callback_data=f'joined_channels_{file["id"]}')])
 
-        await bot.send_message(
+        bot.send_message(
             chat_id,
             f'🔐 <b>Channels Required</b>\n\n'
             f'You must join <b>ALL</b> these channels to download this file:\n\n'
@@ -655,8 +631,8 @@ class BotHandlers:
     # ============================================
     # SHOW MENUS
     # ============================================
-    async def show_main_menu(self, bot, chat_id: int, user_id: int, first_name: str):
-        user_channels = await self.db.get_user_channels(user_id)
+    def show_main_menu(self, bot, chat_id: int, user_id: int, first_name: str):
+        user_channels = self.db.get_user_channels(user_id)
         is_admin = self.is_admin(user_id)
 
         kb = [
@@ -683,15 +659,15 @@ class BotHandlers:
             msg += '⚠️ No channels added!\n'
             msg += 'Use "Manage Channels" to add channels.'
 
-        await bot.send_message(
+        bot.send_message(
             chat_id,
             msg,
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML
         )
 
-    async def show_manage_channels(self, bot, chat_id: int, user_id: int):
-        channels = await self.db.get_user_channels(user_id)
+    def show_manage_channels(self, bot, chat_id: int, user_id: int):
+        channels = self.db.get_user_channels(user_id)
         text = '🔗 Manage Your Channels\n\n'
 
         if channels:
@@ -717,25 +693,25 @@ class BotHandlers:
         kb.append([InlineKeyboardButton('🔒 Add Private Channel', callback_data='addprivate')])
         kb.append([InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')])
 
-        await bot.send_message(
+        bot.send_message(
             chat_id,
             text,
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    async def show_channel_selection(self, bot, chat_id: int, user_id: int):
+    def show_channel_selection(self, bot, chat_id: int, user_id: int):
         session = self.get_session(user_id)
         if not session:
             return
 
         if session.get('msg_id'):
             try:
-                await bot.delete_message(chat_id, session['msg_id'])
+                bot.delete_message(chat_id, session['msg_id'])
             except Exception:
                 pass
             session['msg_id'] = None
 
-        channels = await self.db.get_user_channels(user_id)
+        channels = self.db.get_user_channels(user_id)
         selected = session.get('selected_channels', [])
         kb = []
 
@@ -754,7 +730,7 @@ class BotHandlers:
         kb.append([InlineKeyboardButton('✅ Done Selecting', callback_data='ch_done')])
         kb.append([InlineKeyboardButton('❌ Cancel', callback_data='cancel')])
 
-        msg = await bot.send_message(
+        msg = bot.send_message(
             chat_id,
             f'✅ File Received!\n\n'
             f'📄 {session["info"]["name"]}\n'
@@ -768,7 +744,7 @@ class BotHandlers:
         if msg:
             session['msg_id'] = msg.message_id
 
-    async def show_expiry_options(self, bot, chat_id: int):
+    def show_expiry_options(self, bot, chat_id: int):
         kb = [
             [InlineKeyboardButton('5 min', callback_data='exp_5min'),
              InlineKeyboardButton('10 min', callback_data='exp_10min')],
@@ -780,7 +756,7 @@ class BotHandlers:
              InlineKeyboardButton('♾️ Permanent', callback_data='exp_permanent')],
             [InlineKeyboardButton('❌ Cancel', callback_data='cancel')]
         ]
-        await bot.send_message(
+        bot.send_message(
             chat_id,
             '⏰ Set expiry time:',
             reply_markup=InlineKeyboardMarkup(kb)
@@ -789,36 +765,38 @@ class BotHandlers:
     # ============================================
     # START COMMAND
     # ============================================
-    async def start_command(self, update: Update, context: CallbackContext):
+    def start_command(self, update: Update, context: CallbackContext):
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
         first_name = update.effective_user.first_name or 'User'
         args = context.args
         link = args[0] if args else None
 
-        await self.db.create_user(user_id, update.effective_user.username or '', first_name)
+        logger.info(f'📨 /start from user {user_id} ({first_name})')
+
+        self.db.create_user(user_id, update.effective_user.username or '', first_name)
         self.clear_session(user_id)
 
         # Check required channels
-        channel_status = await self.check_all_required_channels(context.bot, user_id)
+        channel_status = self.check_all_required_channels(context.bot, user_id)
         all_joined = all(c['joined'] for c in channel_status)
 
         if not all_joined:
-            await self.force_join_required_channels(context.bot, chat_id, user_id)
+            self.force_join_required_channels(context.bot, chat_id, user_id)
             return
 
-        await self.db.mark_required_joined(user_id)
+        self.db.mark_required_joined(user_id)
 
         # Handle file link if provided
         if link:
-            file = await self.db.get_file_by_link(link)
+            file = self.db.get_file_by_link(link)
             if not file:
-                await update.message.reply_text('❌ Invalid or expired link.')
+                update.message.reply_text('❌ Invalid or expired link.')
                 return
 
             if file.get('expiry') and datetime.fromisoformat(file['expiry']) < datetime.now():
-                await self.db.delete_file(file['id'])
-                await update.message.reply_text('❌ This file has expired.')
+                self.db.delete_file(file['id'])
+                update.message.reply_text('❌ This file has expired.')
                 return
 
             # Check if user needs to join channels
@@ -826,39 +804,39 @@ class BotHandlers:
                 channel_ids = [int(cid) for cid in file['channel_ids'].split(',') if cid]
                 all_joined_channels = True
                 for cid in channel_ids:
-                    joined = await self.is_user_member_of_channel(context.bot, user_id, cid)
+                    joined = self.is_user_member_of_channel(context.bot, user_id, cid)
                     if not joined:
                         all_joined_channels = False
                         break
                 if not all_joined_channels:
-                    await self.force_join_user_channels(context.bot, chat_id, user_id, file)
+                    self.force_join_user_channels(context.bot, chat_id, user_id, file)
                     return
 
-            await self.db.increment_downloads(file['id'])
+            self.db.increment_downloads(file['id'])
 
             try:
                 if file.get('file_id'):
-                    await context.bot.send_document(
+                    context.bot.send_document(
                         chat_id, file['file_id'],
                         caption=f'📄 {file["name"]}\n📦 {self.format_file_size(file["size"])}'
                     )
                 elif file.get('from_chat_id') and file.get('original_message_id'):
-                    await context.bot.forward_message(
+                    context.bot.forward_message(
                         chat_id, file['from_chat_id'], file['original_message_id']
                     )
             except Exception as e:
                 logger.error(f'Failed to send file: {e}')
-                await update.message.reply_text('❌ Failed to send file.')
+                update.message.reply_text('❌ Failed to send file.')
             return
 
-        await self.show_main_menu(context.bot, chat_id, user_id, first_name)
+        self.show_main_menu(context.bot, chat_id, user_id, first_name)
 
     # ============================================
     # CALLBACK HANDLER
     # ============================================
-    async def callback_handler(self, update: Update, context: CallbackContext):
+    def callback_handler(self, update: Update, context: CallbackContext):
         query = update.callback_query
-        await query.answer()
+        query.answer()
 
         user_id = query.from_user.id
         chat_id = query.message.chat.id
@@ -868,18 +846,18 @@ class BotHandlers:
 
         # ---- CHECK REQUIRED JOIN ----
         if data == 'check_required_join':
-            channel_status = await self.check_all_required_channels(context.bot, user_id)
+            channel_status = self.check_all_required_channels(context.bot, user_id)
             all_joined = all(c['joined'] for c in channel_status)
 
             if all_joined:
-                await self.db.mark_required_joined(user_id)
+                self.db.mark_required_joined(user_id)
                 try:
-                    await context.bot.delete_message(chat_id, query.message.message_id)
+                    context.bot.delete_message(chat_id, query.message.message_id)
                 except Exception:
                     pass
-                await context.bot.send_message(chat_id, '✅ Thank you for joining all required channels!')
-                user = await self.db.get_user(user_id)
-                await self.show_main_menu(
+                context.bot.send_message(chat_id, '✅ Thank you for joining all required channels!')
+                user = self.db.get_user(user_id)
+                self.show_main_menu(
                     context.bot, chat_id, user_id,
                     user['first_name'] if user else 'User'
                 )
@@ -888,7 +866,7 @@ class BotHandlers:
                 kb = []
 
                 for ch in missing:
-                    link = await self.get_channel_link(context.bot, ch['channel'], {
+                    link = self.get_channel_link(context.bot, ch['channel'], {
                         'channel_id': ch['channel_id'],
                         'link': ch['link']
                     })
@@ -898,7 +876,7 @@ class BotHandlers:
 
                 missing_list = ', '.join(c['channel'] for c in missing)
 
-                await query.edit_message_text(
+                query.edit_message_text(
                     f'❌ You haven\'t joined all channels yet.\n\n'
                     f'Missing: {missing_list}\n\n'
                     f'Join all channels and click "I\'ve Joined All (Retry)".',
@@ -910,12 +888,12 @@ class BotHandlers:
         # ---- BACK TO MENU ----
         if data == 'back_to_menu':
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
-            user = await self.db.get_user(user_id)
+            user = self.db.get_user(user_id)
             self.clear_session(user_id)
-            await self.show_main_menu(
+            self.show_main_menu(
                 context.bot, chat_id, user_id,
                 user['first_name'] if user else 'User'
             )
@@ -923,7 +901,7 @@ class BotHandlers:
 
         # ---- HELP ----
         if data == 'help':
-            await query.edit_message_text(
+            query.edit_message_text(
                 f'❓ Help\n\n'
                 f'📤 Upload: Send or forward files\n'
                 f'🔄 Forward: Up to 2GB\n'
@@ -943,9 +921,9 @@ class BotHandlers:
 
         # ---- STATS ----
         if data == 'stats':
-            total_files = await self.db.get_total_files()
-            user_files = await self.db.get_user_files(user_id)
-            await query.edit_message_text(
+            total_files = self.db.get_total_files()
+            user_files = self.db.get_user_files(user_id)
+            query.edit_message_text(
                 f'📊 Statistics\n\n'
                 f'👥 User ID: {user_id}\n'
                 f'📁 Your Files: {len(user_files)}\n'
@@ -960,9 +938,9 @@ class BotHandlers:
 
         # ---- MY FILES ----
         if data == 'my_files':
-            files = await self.db.get_user_files(user_id)
+            files = self.db.get_user_files(user_id)
             if not files:
-                await query.edit_message_text(
+                query.edit_message_text(
                     '📂 No files uploaded.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')]
@@ -987,7 +965,7 @@ class BotHandlers:
                 text += f'🔗 https://t.me/{self.bot_username}?start={f["link_code"]}\n\n'
                 btns.append([InlineKeyboardButton(f'🗑 Delete: {f["name"][:15]}', callback_data=f'delete_{f["id"]}')])
             btns.append([InlineKeyboardButton('🔙 Back', callback_data='back_to_menu')])
-            await query.edit_message_text(
+            query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(btns),
                 parse_mode=ParseMode.HTML
@@ -997,8 +975,8 @@ class BotHandlers:
         # ---- DELETE FILE ----
         if data.startswith('delete_'):
             file_id = data.replace('delete_', '')
-            await self.db.delete_file(file_id)
-            await query.edit_message_text(
+            self.db.delete_file(file_id)
+            query.edit_message_text(
                 '✅ File deleted.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔙 Back', callback_data='my_files')]
@@ -1009,16 +987,16 @@ class BotHandlers:
         # ---- MANAGE CHANNELS ----
         if data == 'managechannels':
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
-            await self.show_manage_channels(context.bot, chat_id, user_id)
+            self.show_manage_channels(context.bot, chat_id, user_id)
             return
 
         # ---- ADD PUBLIC CHANNEL ----
         if data == 'addchannel':
             self.set_session(user_id, {'step': 'waiting_public_channel'})
-            await query.edit_message_text(
+            query.edit_message_text(
                 f'🌐 Add Public Channel\n\n'
                 f'Send your public channel username:\n\n'
                 f'• @my_channel\n'
@@ -1034,7 +1012,7 @@ class BotHandlers:
         # ---- ADD PRIVATE CHANNEL ----
         if data == 'addprivate':
             self.set_session(user_id, {'step': 'waiting_private_channel'})
-            await query.edit_message_text(
+            query.edit_message_text(
                 f'🔒 Add Private Channel\n\n'
                 f'To add a private channel:\n\n'
                 f'1. Make sure @{self.bot_username} is an admin in the channel\n'
@@ -1048,19 +1026,19 @@ class BotHandlers:
         # ---- REMOVE CHANNEL ----
         if data.startswith('remove_'):
             channel_id = int(data.replace('remove_', ''))
-            await self.db.remove_user_channel(user_id, channel_id)
+            self.db.remove_user_channel(user_id, channel_id)
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
-            await self.show_manage_channels(context.bot, chat_id, user_id)
+            self.show_manage_channels(context.bot, chat_id, user_id)
             return
 
         # ---- UPLOAD ----
         if data == 'upload':
-            user_channels = await self.db.get_user_channels(user_id)
+            user_channels = self.db.get_user_channels(user_id)
             if not user_channels:
-                await context.bot.send_message(
+                context.bot.send_message(
                     chat_id,
                     f'⚠️ No channels added!\n\n'
                     f'Add at least one channel first using "Manage Channels".',
@@ -1072,10 +1050,10 @@ class BotHandlers:
 
             self.set_session(user_id, {'step': 'waiting_file'})
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
-            await context.bot.send_message(
+            context.bot.send_message(
                 chat_id,
                 f'📤 Upload Your File\n\n'
                 f'Send or forward the file you want to share.\n\n'
@@ -1090,16 +1068,16 @@ class BotHandlers:
         # ---- ADMIN ----
         if data == 'admin':
             if not self.is_admin(user_id):
-                await context.bot.send_message(chat_id, '❌ Access denied. Admin only.')
+                context.bot.send_message(chat_id, '❌ Access denied. Admin only.')
                 return
 
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
-            total_files = await self.db.get_total_files()
+            total_files = self.db.get_total_files()
 
-            await context.bot.send_message(
+            context.bot.send_message(
                 chat_id,
                 f'🛠 <b>Admin Panel</b>\n\n'
                 f'📁 Total Files: {total_files or 0}\n'
@@ -1118,9 +1096,9 @@ class BotHandlers:
         if data == 'admin_files':
             if not self.is_admin(user_id):
                 return
-            files = await self.db.get_user_files(user_id)
+            files = self.db.get_user_files(user_id)
             if not files:
-                await query.edit_message_text(
+                query.edit_message_text(
                     '📂 No files.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('🔙 Back', callback_data='admin')]
@@ -1143,7 +1121,7 @@ class BotHandlers:
                 text += f'⏰ {expiry_text}\n\n'
                 btns.append([InlineKeyboardButton(f'🗑 Delete: {f["name"][:15]}', callback_data=f'admin_delete_{f["id"]}')])
             btns.append([InlineKeyboardButton('🔙 Back', callback_data='admin')])
-            await query.edit_message_text(
+            query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(btns),
                 parse_mode=ParseMode.HTML
@@ -1155,8 +1133,8 @@ class BotHandlers:
             if not self.is_admin(user_id):
                 return
             file_id = data.replace('admin_delete_', '')
-            await self.db.delete_file(file_id)
-            await query.edit_message_text(
+            self.db.delete_file(file_id)
+            query.edit_message_text(
                 '✅ File deleted.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔙 Back', callback_data='admin_files')]
@@ -1169,7 +1147,7 @@ class BotHandlers:
             if not self.is_admin(user_id):
                 return
             count = self.db.cleanup_expired_files()
-            await query.edit_message_text(
+            query.edit_message_text(
                 f'✅ Cleanup complete!\n\nRemoved {count} expired files.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔙 Back', callback_data='admin')]
@@ -1182,9 +1160,9 @@ class BotHandlers:
             session = self.get_session(user_id)
             if not session:
                 return
-            channels = await self.db.get_user_channels(user_id)
+            channels = self.db.get_user_channels(user_id)
             session['selected_channels'] = [c['id'] for c in channels]
-            await self.show_channel_selection(context.bot, chat_id, user_id)
+            self.show_channel_selection(context.bot, chat_id, user_id)
             return
 
         if data.startswith('ch_') and data not in ['ch_done', 'ch_skip', 'ch_all']:
@@ -1198,7 +1176,7 @@ class BotHandlers:
             else:
                 session['selected_channels'].append(channel_id)
 
-            await self.show_channel_selection(context.bot, chat_id, user_id)
+            self.show_channel_selection(context.bot, chat_id, user_id)
             return
 
         # ---- CH_DONE ----
@@ -1211,13 +1189,13 @@ class BotHandlers:
 
             if session.get('msg_id'):
                 try:
-                    await context.bot.delete_message(chat_id, session['msg_id'])
+                    context.bot.delete_message(chat_id, session['msg_id'])
                 except Exception:
                     pass
                 session['msg_id'] = None
 
             session['step'] = 'waiting_expiry'
-            await self.show_expiry_options(context.bot, chat_id)
+            self.show_expiry_options(context.bot, chat_id)
             return
 
         # ---- CH_SKIP ----
@@ -1232,13 +1210,13 @@ class BotHandlers:
 
             if session.get('msg_id'):
                 try:
-                    await context.bot.delete_message(chat_id, session['msg_id'])
+                    context.bot.delete_message(chat_id, session['msg_id'])
                 except Exception:
                     pass
                 session['msg_id'] = None
 
             session['step'] = 'waiting_expiry'
-            await self.show_expiry_options(context.bot, chat_id)
+            self.show_expiry_options(context.bot, chat_id)
             return
 
         # ---- EXPIRY ----
@@ -1263,11 +1241,11 @@ class BotHandlers:
                 'expiry': expiry
             }
 
-            result = await self.db.create_file(file_data)
+            result = self.db.create_file(file_data)
 
             # Add file-channel associations
             for cid in session['selected_channels']:
-                await self.db.add_file_channel(result['id'], cid)
+                self.db.add_file_channel(result['id'], cid)
 
             file_link = result['link_code']
 
@@ -1276,11 +1254,11 @@ class BotHandlers:
             link = f'https://t.me/{self.bot_username}?start={file_link}'
 
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
 
-            await context.bot.send_message(
+            context.bot.send_message(
                 chat_id,
                 f'✅ <b>File Uploaded!</b>\n\n'
                 f'📄 {file_data["name"]}\n'
@@ -1303,9 +1281,9 @@ class BotHandlers:
         if data.startswith('joined_channels_'):
             file_id = data.replace('joined_channels_', '')
 
-            file = await self.db.get_file_by_id(file_id)
+            file = self.db.get_file_by_id(file_id)
             if not file:
-                await query.edit_message_text(
+                query.edit_message_text(
                     '❌ File not found. It may have been deleted or expired.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
@@ -1314,8 +1292,8 @@ class BotHandlers:
                 return
 
             if file.get('expiry') and datetime.fromisoformat(file['expiry']) < datetime.now():
-                await self.db.delete_file(file['id'])
-                await query.edit_message_text(
+                self.db.delete_file(file['id'])
+                query.edit_message_text(
                     '❌ This file has expired.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
@@ -1327,26 +1305,26 @@ class BotHandlers:
 
             all_joined = True
             for cid in channel_ids:
-                joined = await self.is_user_member_of_channel(context.bot, user_id, cid)
+                joined = self.is_user_member_of_channel(context.bot, user_id, cid)
                 if not joined:
                     all_joined = False
                     break
 
             if not all_joined:
                 kb = []
-                user_channels = await self.db.get_user_channels(file['user_id'])
+                user_channels = self.db.get_user_channels(file['user_id'])
 
                 for cid in channel_ids:
                     channel = next((c for c in user_channels if c['id'] == cid), None)
                     if channel:
-                        link = await self.get_channel_link(context.bot, channel['channel_name'], {
+                        link = self.get_channel_link(context.bot, channel['channel_name'], {
                             'channel_id': channel['channel_id'],
                             'link': channel['link']
                         })
                         kb.append([InlineKeyboardButton(f'📢 Join {channel["channel_name"]}', url=link)])
                 kb.append([InlineKeyboardButton('✅ I\'ve Joined All', callback_data=f'joined_channels_{file_id}')])
 
-                await query.edit_message_text(
+                query.edit_message_text(
                     f'❌ You haven\'t joined all channels yet.\n\n'
                     f'Please join all channels and click "I\'ve Joined All".',
                     reply_markup=InlineKeyboardMarkup(kb),
@@ -1354,39 +1332,39 @@ class BotHandlers:
                 )
                 return
 
-            await self.db.increment_downloads(file['id'])
+            self.db.increment_downloads(file['id'])
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
 
             try:
                 if file.get('file_id'):
-                    await context.bot.send_document(
+                    context.bot.send_document(
                         chat_id, file['file_id'],
                         caption=f'📄 {file["name"]}\n📦 {self.format_file_size(file["size"])}\n📥 {file["downloads"] + 1} downloads'
                     )
                 elif file.get('from_chat_id') and file.get('original_message_id'):
-                    await context.bot.forward_message(
+                    context.bot.forward_message(
                         chat_id, file['from_chat_id'], file['original_message_id']
                     )
                 else:
-                    await context.bot.send_message(chat_id, '❌ Failed to send file. The file data is incomplete.')
+                    context.bot.send_message(chat_id, '❌ Failed to send file. The file data is incomplete.')
             except Exception as e:
                 logger.error(f'❌ Send file error: {e}')
-                await context.bot.send_message(chat_id, '❌ Failed to send file. Please try again.')
+                context.bot.send_message(chat_id, '❌ Failed to send file. Please try again.')
             return
 
         # ---- CANCEL ----
         if data == 'cancel':
             self.clear_session(user_id)
             try:
-                await context.bot.delete_message(chat_id, query.message.message_id)
+                context.bot.delete_message(chat_id, query.message.message_id)
             except Exception:
                 pass
-            await context.bot.send_message(chat_id, '❌ Cancelled.')
-            user = await self.db.get_user(user_id)
-            await self.show_main_menu(
+            context.bot.send_message(chat_id, '❌ Cancelled.')
+            user = self.db.get_user(user_id)
+            self.show_main_menu(
                 context.bot, chat_id, user_id,
                 user['first_name'] if user else 'User'
             )
@@ -1395,7 +1373,7 @@ class BotHandlers:
     # ============================================
     # TEXT HANDLER
     # ============================================
-    async def text_handler(self, update: Update, context: CallbackContext):
+    def text_handler(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         msg = update.message
@@ -1405,7 +1383,7 @@ class BotHandlers:
 
         if msg.text == '/cancel':
             self.clear_session(user_id)
-            await msg.reply_text(
+            msg.reply_text(
                 '❌ Cancelled.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
@@ -1417,19 +1395,19 @@ class BotHandlers:
         if msg.forward_from_chat:
             session = self.get_session(user_id)
             if session and session.get('step') == 'waiting_private_channel':
-                await self.handle_private_channel_detection(update, context)
+                self.handle_private_channel_detection(update, context)
                 return
 
         # Handle public channel add
         session = self.get_session(user_id)
         if session and session.get('step') == 'waiting_public_channel':
             channel_input = msg.text.strip()
-            await self.handle_public_channel_add(update, context, channel_input)
+            self.handle_public_channel_add(update, context, channel_input)
 
     # ============================================
     # PRIVATE CHANNEL DETECTION
     # ============================================
-    async def handle_private_channel_detection(self, update: Update, context: CallbackContext):
+    def handle_private_channel_detection(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         msg = update.message
@@ -1441,10 +1419,10 @@ class BotHandlers:
         if not session or session.get('step') != 'waiting_private_channel':
             return
 
-        detection = await self.detect_private_channel_from_forward(context.bot, msg)
+        detection = self.detect_private_channel_from_forward(context.bot, msg)
 
         if not detection['success']:
-            await context.bot.send_message(
+            context.bot.send_message(
                 chat_id,
                 f'❌ {detection["error"]}',
                 reply_markup=InlineKeyboardMarkup([
@@ -1454,11 +1432,11 @@ class BotHandlers:
             )
             return
 
-        existing = await self.db.get_user_channels(user_id)
+        existing = self.db.get_user_channels(user_id)
         exists = any(c['channel_id'] == detection['channel_id'] for c in existing)
 
         if exists:
-            await context.bot.send_message(
+            context.bot.send_message(
                 chat_id,
                 f'⚠️ This channel is already in your list.\n\n'
                 f'📢 {detection["title"]}\n'
@@ -1470,7 +1448,7 @@ class BotHandlers:
             self.clear_session(user_id)
             return
 
-        await self.db.add_user_channel(user_id, {
+        self.db.add_user_channel(user_id, {
             'name': detection['title'],
             'channel_id': detection['channel_id'],
             'type': 'private',
@@ -1478,9 +1456,9 @@ class BotHandlers:
         })
 
         self.clear_session(user_id)
-        channels = await self.db.get_user_channels(user_id)
+        channels = self.db.get_user_channels(user_id)
 
-        await context.bot.send_message(
+        context.bot.send_message(
             chat_id,
             f'✅ <b>Private Channel Added!</b>\n\n'
             f'📢 {detection["title"]}\n'
@@ -1498,13 +1476,13 @@ class BotHandlers:
     # ============================================
     # PUBLIC CHANNEL ADD
     # ============================================
-    async def handle_public_channel_add(self, update: Update, context: CallbackContext, channel_input: str):
+    def handle_public_channel_add(self, update: Update, context: CallbackContext, channel_input: str):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
 
-        detection = await self.detect_public_channel(context.bot, channel_input)
+        detection = self.detect_public_channel(context.bot, channel_input)
         if not detection['success']:
-            await context.bot.send_message(
+            context.bot.send_message(
                 chat_id,
                 f'❌ {detection["error"]}',
                 reply_markup=InlineKeyboardMarkup([
@@ -1514,16 +1492,16 @@ class BotHandlers:
             )
             return
 
-        existing = await self.db.get_user_channels(user_id)
+        existing = self.db.get_user_channels(user_id)
         exists = any(c['channel_id'] == detection['channel_id'] for c in existing)
 
         if exists:
-            await context.bot.send_message(chat_id, '⚠️ This channel is already in your list.')
+            context.bot.send_message(chat_id, '⚠️ This channel is already in your list.')
             self.clear_session(user_id)
-            await self.show_manage_channels(context.bot, chat_id, user_id)
+            self.show_manage_channels(context.bot, chat_id, user_id)
             return
 
-        await self.db.add_user_channel(user_id, {
+        self.db.add_user_channel(user_id, {
             'name': detection['title'],
             'channel_id': detection['channel_id'],
             'type': 'public',
@@ -1531,9 +1509,9 @@ class BotHandlers:
         })
 
         self.clear_session(user_id)
-        channels = await self.db.get_user_channels(user_id)
+        channels = self.db.get_user_channels(user_id)
 
-        await context.bot.send_message(
+        context.bot.send_message(
             chat_id,
             f'✅ <b>Channel Added!</b>\n\n'
             f'📢 {detection["title"]}\n'
@@ -1550,7 +1528,7 @@ class BotHandlers:
     # ============================================
     # FILE HANDLER
     # ============================================
-    async def file_handler(self, update: Update, context: CallbackContext, file_type: str):
+    def file_handler(self, update: Update, context: CallbackContext, file_type: str):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         msg = update.message
@@ -1603,38 +1581,17 @@ class BotHandlers:
 
         # Check size limit for direct sends
         if not is_forwarded and file_size > MAX_FILE_SIZE_SEND:
-            await msg.reply_text(
+            msg.reply_text(
                 f'❌ File too large ({self.format_file_size(file_size)}).\n\n'
                 f'Please FORWARD the file instead (supports up to 2GB).'
             )
             return
 
-        # Create file in database
-        unique_id = secrets.token_hex(16)
-        user_channels = await self.db.get_user_channels(user_id)
+        # Get user channels
+        user_channels = self.db.get_user_channels(user_id)
 
-        # Store in session for channel selection
-        self.sessions[user_id] = {
-            'step': 'waiting_channels',
-            'file_id': unique_id,
-            'info': {
-                'name': file_name,
-                'size': file_size,
-                'mime_type': mime_type,
-                'file_id': file_id,
-                'from_chat_id': from_chat_id,
-                'original_message_id': original_message_id,
-                'is_forwarded': is_forwarded
-            },
-            'selected_channels': [ch['id'] for ch in user_channels],
-            'created_at': datetime.now()
-        }
-
-        # If user has channels, go to channel selection
-        if user_channels:
-            await self.show_channel_selection(context.bot, chat_id, user_id)
-        else:
-            await msg.reply_text(
+        if not user_channels:
+            msg.reply_text(
                 '⚠️ No channels found! Please add a channel first.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔗 Manage Channels', callback_data='managechannels')],
@@ -1642,6 +1599,52 @@ class BotHandlers:
                 ])
             )
             self.clear_session(user_id)
+            return
+
+        # Create file in database
+        unique_id = secrets.token_hex(16)
+        
+        file_data = {
+            'id': unique_id,
+            'user_id': user_id,
+            'name': file_name,
+            'size': file_size,
+            'mime_type': mime_type,
+            'file_id': file_id,
+            'from_chat_id': from_chat_id,
+            'original_message_id': original_message_id,
+            'is_forwarded': 1 if is_forwarded else 0,
+            'expiry': None
+        }
+
+        result = self.db.create_file(file_data)
+
+        # Add file-channel associations
+        for ch in user_channels:
+            self.db.add_file_channel(result['id'], ch['id'])
+
+        self.clear_session(user_id)
+
+        link = f'https://t.me/{self.bot_username}?start={result["link_code"]}'
+
+        channel_list = '\n'.join(f'• {c["channel_name"]}' for c in user_channels)
+
+        msg.reply_text(
+            f'✅ <b>File Uploaded!</b>\n\n'
+            f'📄 {file_name}\n'
+            f'📦 {self.format_file_size(file_size)}\n'
+            f'⏰ ♾️ Permanent\n'
+            f'📢 Channels: {len(user_channels)} channel(s)\n\n'
+            f'🔗 Shareable Link:\n'
+            f'{link}\n\n'
+            f'📋 Required Channels:\n{channel_list}',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('📤 Upload More', callback_data='upload')],
+                [InlineKeyboardButton('📂 My Files', callback_data='my_files')],
+                [InlineKeyboardButton('🔙 Back to Menu', callback_data='back_to_menu')]
+            ]),
+            parse_mode=ParseMode.HTML
+        )
 
 
 # ============================================
@@ -1678,6 +1681,9 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # Store handlers reference
+    handlers.updater = updater
+
     # Store bot info
     bot_info = updater.bot.get_me()
     handlers.bot_username = bot_info.username
@@ -1697,7 +1703,7 @@ def main():
         ('start', '🚀 Start the bot'),
     ])
 
-    # Add handlers
+    # Add handlers - using lambda to pass file_type
     dp.add_handler(CommandHandler('start', handlers.start_command))
     dp.add_handler(MessageHandler(Filters.document, lambda u, c: handlers.file_handler(u, c, 'document')))
     dp.add_handler(MessageHandler(Filters.photo, lambda u, c: handlers.file_handler(u, c, 'photo')))
