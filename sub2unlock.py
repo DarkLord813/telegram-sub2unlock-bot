@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================
 # TELEGRAM FILE SHARING BOT - COMPLETE WORKING VERSION
-# Fixed: AttributeError for forward_origin in python-telegram-bot 13.7
+# With Keep-Alive Ping to prevent Render from sleeping
 # ============================================
 
 import os
@@ -10,6 +10,9 @@ import sqlite3
 import secrets
 import logging
 import re
+import requests
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
@@ -24,7 +27,6 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from aiohttp import web
 import asyncio
-import threading
 
 # Load environment variables
 load_dotenv()
@@ -37,6 +39,7 @@ ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if 
 DB_PATH = os.getenv('DB_PATH', './data/bot_database.db')
 MAX_FILE_SIZE_SEND = 50 * 1024 * 1024  # 50MB for direct send
 PORT = int(os.getenv('PORT', 10000))
+RENDER_URL = os.getenv('RENDER_URL', '')  # Your Render URL (e.g., https://your-bot.onrender.com)
 
 if not BOT_TOKEN:
     print('❌ BOT_TOKEN is not set in environment variables')
@@ -82,6 +85,22 @@ EXPIRY_MAP = {
     '24hr': 24 * 60 * 60,
     'permanent': None
 }
+
+
+# ============================================
+# KEEP ALIVE FUNCTION
+# ============================================
+def keep_alive():
+    """Keep the bot alive by pinging the health endpoint periodically"""
+    url = RENDER_URL or f'https://telegram-sub2unlock-bot.onrender.com/health'
+    
+    while True:
+        try:
+            response = requests.get(url, timeout=10)
+            logger.info(f'💓 Keep-alive ping sent: {response.status_code}')
+        except Exception as e:
+            logger.error(f'❌ Keep-alive ping failed: {e}')
+        time.sleep(300)  # Ping every 5 minutes
 
 
 # ============================================
@@ -1546,7 +1565,7 @@ class BotHandlers:
         )
 
     # ============================================
-    # FILE HANDLER - FIXED: Removed forward_origin
+    # FILE HANDLER
     # ============================================
     def file_handler(self, update: Update, context: CallbackContext, file_type: str):
         user_id = update.effective_user.id
@@ -1579,7 +1598,7 @@ class BotHandlers:
             )
             return
 
-        # Get file info - FIXED: Removed forward_origin (not available in v13.7)
+        # Get file info
         file = None
         file_name = None
         mime_type = None
@@ -1596,8 +1615,6 @@ class BotHandlers:
             original_message_id = msg.forward_from_message_id
         elif msg.forward_from:
             is_forwarded = True
-            # Forward from user, not channel - we'll handle differently
-            pass
 
         # Get file based on type
         if file_type == 'document':
@@ -1680,6 +1697,7 @@ async def start_health_server():
     await site.start()
     logger.info(f"✅ Health check server running on port {PORT}")
 
+
 def run_health_server():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1731,6 +1749,11 @@ def main():
     logger.info('  🌐 Public: Send @username or link')
     logger.info('  🔒 Private: Forward a message (bot creates permanent invite link)')
     logger.info(f'\n👑 Admins: {", ".join(str(a) for a in ADMIN_IDS) if ADMIN_IDS else "None"}')
+
+    # Start keep-alive thread
+    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+    keep_alive_thread.start()
+    logger.info('💓 Keep-alive thread started (pings every 5 minutes)')
 
     # Start health check server in background thread
     health_thread = threading.Thread(target=run_health_server, daemon=True)
