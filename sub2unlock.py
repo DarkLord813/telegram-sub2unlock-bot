@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================
 # TELEGRAM FILE SHARING BOT - COMPLETE WORKING VERSION
-# Fixed: Proper session handling for file uploads
+# Fixed: AttributeError for forward_origin in python-telegram-bot 13.7
 # ============================================
 
 import os
@@ -194,6 +194,22 @@ class Database:
         cursor.execute('SELECT * FROM required_channels WHERE verified = 1')
         return [dict(row) for row in cursor.fetchall()]
 
+    def update_required_channel_id(self, channel_name: str, channel_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE required_channels SET channel_id = ? WHERE channel_name = ?',
+            (channel_id, channel_name)
+        )
+        self.conn.commit()
+
+    def update_channel_link(self, channel_name: str, link: str):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE required_channels SET link = ? WHERE channel_name = ?',
+            (link, channel_name)
+        )
+        self.conn.commit()
+
     def get_user(self, user_id: int) -> Optional[Dict]:
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
@@ -349,7 +365,7 @@ class BotHandlers:
         self.db = db
         self.bot_username = ''
         self.bot_id = 0
-        self.sessions = {}  # user_id -> session data
+        self.sessions = {}
 
     def format_file_size(self, bytes: int) -> str:
         if bytes < 1024:
@@ -381,7 +397,6 @@ class BotHandlers:
         return user_id in ADMIN_IDS
 
     def get_session(self, user_id: int) -> Optional[Dict]:
-        """Get session for user, remove if expired (> 1 hour)"""
         session = self.sessions.get(user_id)
         if session and session.get('created_at'):
             if (datetime.now() - session['created_at']).seconds > 3600:
@@ -390,13 +405,11 @@ class BotHandlers:
         return session
 
     def set_session(self, user_id: int, data: Dict):
-        """Set session for user with timestamp"""
         data['created_at'] = datetime.now()
         self.sessions[user_id] = data
         logger.info(f'📝 Session set for user {user_id}: {data.get("step")}')
 
     def clear_session(self, user_id: int):
-        """Clear session for user"""
         if user_id in self.sessions:
             logger.info(f'🗑️ Session cleared for user {user_id}')
             self.sessions.pop(user_id, None)
@@ -1054,7 +1067,6 @@ class BotHandlers:
                 )
                 return
 
-            # Set session for file upload
             self.set_session(user_id, {'step': 'waiting_file'})
             try:
                 context.bot.delete_message(chat_id, query.message.message_id)
@@ -1166,7 +1178,6 @@ class BotHandlers:
         if data == 'ch_all':
             session = self.get_session(user_id)
             if not session:
-                logger.warning(f'No session found for user {user_id} in ch_all')
                 return
             channels = self.db.get_user_channels(user_id)
             session['selected_channels'] = [c['id'] for c in channels]
@@ -1177,7 +1188,6 @@ class BotHandlers:
             channel_id = int(data.replace('ch_', ''))
             session = self.get_session(user_id)
             if not session:
-                logger.warning(f'No session found for user {user_id} in ch_ selection')
                 return
 
             if channel_id in session['selected_channels']:
@@ -1192,7 +1202,6 @@ class BotHandlers:
         if data == 'ch_done':
             session = self.get_session(user_id)
             if not session:
-                logger.warning(f'No session found for user {user_id} in ch_done')
                 return
 
             logger.info(f'✅ Done selecting. Selected: {len(session["selected_channels"])} channels')
@@ -1212,7 +1221,6 @@ class BotHandlers:
         if data == 'ch_skip':
             session = self.get_session(user_id)
             if not session:
-                logger.warning(f'No session found for user {user_id} in ch_skip')
                 return
 
             logger.info('⏭️ Skipping channel selection')
@@ -1237,7 +1245,6 @@ class BotHandlers:
             expiry = (datetime.now() + timedelta(seconds=expiry_seconds)).isoformat() if expiry_seconds else None
             session = self.get_session(user_id)
             if not session or not session.get('file_id'):
-                logger.warning(f'No session or file_id for user {user_id} in expiry')
                 return
 
             file_data = {
@@ -1255,7 +1262,6 @@ class BotHandlers:
 
             result = self.db.create_file(file_data)
 
-            # Add file-channel associations
             for cid in session['selected_channels']:
                 self.db.add_file_channel(result['id'], cid)
 
@@ -1540,7 +1546,7 @@ class BotHandlers:
         )
 
     # ============================================
-    # FILE HANDLER
+    # FILE HANDLER - FIXED: Removed forward_origin
     # ============================================
     def file_handler(self, update: Update, context: CallbackContext, file_type: str):
         user_id = update.effective_user.id
@@ -1573,7 +1579,7 @@ class BotHandlers:
             )
             return
 
-        # Get file info
+        # Get file info - FIXED: Removed forward_origin (not available in v13.7)
         file = None
         file_name = None
         mime_type = None
@@ -1583,15 +1589,15 @@ class BotHandlers:
         from_chat_id = None
         original_message_id = None
 
-        # Check if forwarded
-        if msg.forward_origin or msg.forward_from or msg.forward_from_chat:
+        # Check if forwarded (using forward_from_chat and forward_from)
+        if msg.forward_from_chat:
             is_forwarded = True
-            if msg.forward_origin and hasattr(msg.forward_origin, 'chat'):
-                from_chat_id = msg.forward_origin.chat.id
-                original_message_id = msg.forward_origin.message_id
-            elif msg.forward_from_chat:
-                from_chat_id = msg.forward_from_chat.id
-                original_message_id = msg.forward_from_message_id
+            from_chat_id = msg.forward_from_chat.id
+            original_message_id = msg.forward_from_message_id
+        elif msg.forward_from:
+            is_forwarded = True
+            # Forward from user, not channel - we'll handle differently
+            pass
 
         # Get file based on type
         if file_type == 'document':
